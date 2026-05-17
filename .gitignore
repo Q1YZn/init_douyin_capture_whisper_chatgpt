@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local IDE / OS files
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
+
+# Local runtime data
+captures/
+jobs/
+logs/
+tmp/
+demo_output/
+server_reports/
+
+# Local databases and artifacts
+*.db
+*.sqlite
+*.sqlite3
+tmp_smoke.wav
+
+# Downloaded / generated models
+models/
+
+# Build outputs
+build/
+dist/
+*.egg-info/
