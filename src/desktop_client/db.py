@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .models import MonitorProfileRecord
+from .models import MonitorProfileRecord, MonitorProfileSource
 
 
 class ClientJobRepository:
@@ -62,6 +62,12 @@ class ClientJobRepository:
             )
             conn.commit()
         self._ensure_column("monitor_profiles", "last_status", "TEXT")
+        self._ensure_column("monitor_profiles", "source_type", "TEXT")
+        self._ensure_column("monitor_profiles", "source_account_sec_uid", "TEXT")
+        self._ensure_column("monitor_profiles", "source_follow_sec_uid", "TEXT")
+        self._ensure_column("monitor_profiles", "source_follow_uid", "TEXT")
+        self._ensure_column("monitor_profiles", "source_nickname", "TEXT")
+        self._backfill_monitor_profile_sources()
         self._migrate_legacy_monitor_profiles()
 
     def create_job(self, payload: dict[str, Any]) -> None:
@@ -135,8 +141,9 @@ class ClientJobRepository:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT profile_url, enabled, last_live_at, last_capture_dir, last_room_id
-                , last_status
+                SELECT profile_url, enabled, last_live_at, last_capture_dir, last_room_id,
+                    last_status, source_type, source_account_sec_uid, source_follow_sec_uid,
+                    source_follow_uid, source_nickname
                 FROM monitor_profiles
                 ORDER BY updated_at DESC, profile_url ASC
                 """
@@ -149,6 +156,11 @@ class ClientJobRepository:
                 last_capture_dir=row["last_capture_dir"],
                 last_room_id=row["last_room_id"],
                 last_status=row["last_status"],
+                source_type=row["source_type"] or MonitorProfileSource.MANUAL.value,
+                source_account_sec_uid=row["source_account_sec_uid"],
+                source_follow_sec_uid=row["source_follow_sec_uid"],
+                source_follow_uid=row["source_follow_uid"],
+                source_nickname=row["source_nickname"],
             )
             for row in rows
         ]
@@ -159,8 +171,10 @@ class ClientJobRepository:
             conn.executemany(
                 """
                 INSERT INTO monitor_profiles (
-                    profile_url, enabled, last_live_at, last_capture_dir, last_room_id, last_status, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    profile_url, enabled, last_live_at, last_capture_dir, last_room_id, last_status,
+                    source_type, source_account_sec_uid, source_follow_sec_uid, source_follow_uid,
+                    source_nickname, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
                 [
                     (
@@ -170,6 +184,11 @@ class ClientJobRepository:
                         profile.last_capture_dir,
                         profile.last_room_id,
                         profile.last_status,
+                        profile.source_type,
+                        profile.source_account_sec_uid,
+                        profile.source_follow_sec_uid,
+                        profile.source_follow_uid,
+                        profile.source_nickname,
                     )
                     for profile in profiles
                 ],
@@ -185,6 +204,11 @@ class ClientJobRepository:
         last_capture_dir: str | None = None,
         last_room_id: str | None = None,
         last_status: str | None = None,
+        source_type: str | None = None,
+        source_account_sec_uid: str | None = None,
+        source_follow_sec_uid: str | None = None,
+        source_follow_uid: str | None = None,
+        source_nickname: str | None = None,
     ) -> None:
         existing = self.get_monitor_profile(profile_url)
         if existing is None:
@@ -196,19 +220,35 @@ class ClientJobRepository:
             last_capture_dir=last_capture_dir if last_capture_dir is not None else existing.last_capture_dir,
             last_room_id=last_room_id if last_room_id is not None else existing.last_room_id,
             last_status=last_status if last_status is not None else existing.last_status,
+            source_type=source_type if source_type is not None else existing.source_type,
+            source_account_sec_uid=source_account_sec_uid
+            if source_account_sec_uid is not None
+            else existing.source_account_sec_uid,
+            source_follow_sec_uid=source_follow_sec_uid
+            if source_follow_sec_uid is not None
+            else existing.source_follow_sec_uid,
+            source_follow_uid=source_follow_uid if source_follow_uid is not None else existing.source_follow_uid,
+            source_nickname=source_nickname if source_nickname is not None else existing.source_nickname,
         )
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO monitor_profiles (
-                    profile_url, enabled, last_live_at, last_capture_dir, last_room_id, last_status, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    profile_url, enabled, last_live_at, last_capture_dir, last_room_id, last_status,
+                    source_type, source_account_sec_uid, source_follow_sec_uid, source_follow_uid,
+                    source_nickname, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(profile_url) DO UPDATE SET
                     enabled = excluded.enabled,
                     last_live_at = excluded.last_live_at,
                     last_capture_dir = excluded.last_capture_dir,
                     last_room_id = excluded.last_room_id,
                     last_status = excluded.last_status,
+                    source_type = excluded.source_type,
+                    source_account_sec_uid = excluded.source_account_sec_uid,
+                    source_follow_sec_uid = excluded.source_follow_sec_uid,
+                    source_follow_uid = excluded.source_follow_uid,
+                    source_nickname = excluded.source_nickname,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -218,6 +258,11 @@ class ClientJobRepository:
                     record.last_capture_dir,
                     record.last_room_id,
                     record.last_status,
+                    record.source_type,
+                    record.source_account_sec_uid,
+                    record.source_follow_sec_uid,
+                    record.source_follow_uid,
+                    record.source_nickname,
                 ),
             )
             conn.commit()
@@ -226,7 +271,9 @@ class ClientJobRepository:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT profile_url, enabled, last_live_at, last_capture_dir, last_room_id, last_status
+                SELECT profile_url, enabled, last_live_at, last_capture_dir, last_room_id,
+                    last_status, source_type, source_account_sec_uid, source_follow_sec_uid,
+                    source_follow_uid, source_nickname
                 FROM monitor_profiles
                 WHERE profile_url = ?
                 """,
@@ -241,7 +288,31 @@ class ClientJobRepository:
             last_capture_dir=row["last_capture_dir"],
             last_room_id=row["last_room_id"],
             last_status=row["last_status"],
+            source_type=row["source_type"] or MonitorProfileSource.MANUAL.value,
+            source_account_sec_uid=row["source_account_sec_uid"],
+            source_follow_sec_uid=row["source_follow_sec_uid"],
+            source_follow_uid=row["source_follow_uid"],
+            source_nickname=row["source_nickname"],
         )
+
+    def delete_following_sync_profiles(self, source_account_sec_uid: str, keep_sec_uids: set[str]) -> int:
+        placeholders = ",".join("?" for _ in keep_sec_uids)
+        params: list[Any] = [
+            MonitorProfileSource.FOLLOWING_SYNC.value,
+            source_account_sec_uid,
+        ]
+        sql = """
+            DELETE FROM monitor_profiles
+            WHERE source_type = ?
+              AND source_account_sec_uid = ?
+        """
+        if keep_sec_uids:
+            sql += f" AND (source_follow_sec_uid IS NULL OR source_follow_sec_uid NOT IN ({placeholders}))"
+            params.extend(sorted(keep_sec_uids))
+        with self._connect() as conn:
+            cursor = conn.execute(sql, params)
+            conn.commit()
+            return cursor.rowcount if cursor.rowcount is not None else 0
 
     def delete_monitor_profile(self, profile_url: str) -> None:
         with self._connect() as conn:
@@ -257,6 +328,18 @@ class ClientJobRepository:
             if column_name in existing:
                 return
             conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+            conn.commit()
+
+    def _backfill_monitor_profile_sources(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE monitor_profiles
+                SET source_type = ?
+                WHERE source_type IS NULL OR source_type = ''
+                """,
+                (MonitorProfileSource.MANUAL.value,),
+            )
             conn.commit()
 
     def _migrate_legacy_monitor_profiles(self) -> None:

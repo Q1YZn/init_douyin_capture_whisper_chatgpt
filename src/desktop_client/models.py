@@ -30,6 +30,11 @@ class MonitorEventSeverity(StrEnum):
     ERROR = "error"
 
 
+class MonitorProfileSource(StrEnum):
+    MANUAL = "manual"
+    FOLLOWING_SYNC = "following_sync"
+
+
 @dataclass(slots=True)
 class WorkflowSnapshot:
     title: str
@@ -84,3 +89,27 @@ class MonitorProfileRecord:
     last_capture_dir: str | None = None
     last_room_id: str | None = None
     last_status: str | None = None
+    source_type: str = MonitorProfileSource.MANUAL.value
+    source_account_sec_uid: str | None = None
+    source_follow_sec_uid: str | None = None
+    source_follow_uid: str | None = None
+    source_nickname: str | None = None
+
+
+@dataclass(slots=True)
+class FollowingProfile:
+    profile_url: str
+    sec_uid: str
+    uid: str | None = None
+    nickname: str | None = None
+
+
+@dataclass(slots=True)
+class FollowingSyncResult:
+    source_account_sec_uid: str
+    fetched: int
+    added: int
+    updated: int
+    removed: int
+    skipped: int = 0
+    error: str | None = None

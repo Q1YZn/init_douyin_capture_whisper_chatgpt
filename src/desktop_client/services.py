@@ -7,6 +7,7 @@ from typing import Callable
 from .config import DesktopSettings
 from .db import ClientJobRepository
 from .f2_runtime import F2RuntimeReport, probe_f2_runtime
+from .following_sync import DouyinFollowingFetcher
 from .live_capture import (
     F2LiveCaptureService,
     LiveCaptureRequest,
@@ -16,14 +17,21 @@ from .live_capture import (
     MultiProfileMonitorRequest,
 )
 from .local_pipeline import DesktopAnalysisService
-from .models import DesktopAnalysisRequest, DesktopAnalysisResult, MonitorProfileRecord
+from .models import (
+    DesktopAnalysisRequest,
+    DesktopAnalysisResult,
+    FollowingSyncResult,
+    MonitorProfileRecord,
+    MonitorProfileSource,
+)
 
 
 class MonitorProfileService:
     """Application-facing service for monitor profile CRUD and history updates."""
 
-    def __init__(self, repo: ClientJobRepository) -> None:
+    def __init__(self, repo: ClientJobRepository, settings: DesktopSettings | None = None) -> None:
         self.repo = repo
+        self.settings = settings
 
     def list_profiles(self) -> list[MonitorProfileRecord]:
         return self.repo.list_monitor_profiles()
@@ -35,7 +43,11 @@ class MonitorProfileService:
         existing = self.repo.get_monitor_profile(cleaned)
         if existing is not None:
             return existing
-        self.repo.upsert_monitor_profile(cleaned, enabled=True)
+        self.repo.upsert_monitor_profile(
+            cleaned,
+            enabled=True,
+            source_type=MonitorProfileSource.MANUAL.value,
+        )
         return self.repo.get_monitor_profile(cleaned) or MonitorProfileRecord(profile_url=cleaned, enabled=True)
 
     def remove_profiles(self, profile_urls: list[str]) -> int:
@@ -107,6 +119,53 @@ class MonitorProfileService:
             )
 
         return self.repo.get_monitor_profile(profile_url)
+
+    def sync_following_profiles(self, source_account: str) -> FollowingSyncResult:
+        if self.settings is None:
+            raise RuntimeError("Desktop settings are required to sync following profiles.")
+        fetch_result = DouyinFollowingFetcher(self.settings).fetch(source_account)
+        existing_by_url = {profile.profile_url: profile for profile in self.list_profiles()}
+        current_sec_uids = {profile.sec_uid for profile in fetch_result.profiles}
+        added = 0
+        updated = 0
+        skipped = 0
+
+        for profile in fetch_result.profiles:
+            existing = existing_by_url.get(profile.profile_url)
+            if existing and existing.source_type != MonitorProfileSource.FOLLOWING_SYNC.value:
+                skipped += 1
+                continue
+            if existing is None:
+                added += 1
+            else:
+                updated += 1
+            self.repo.upsert_monitor_profile(
+                profile.profile_url,
+                enabled=existing.enabled if existing is not None else True,
+                source_type=MonitorProfileSource.FOLLOWING_SYNC.value,
+                source_account_sec_uid=fetch_result.source_account_sec_uid,
+                source_follow_sec_uid=profile.sec_uid,
+                source_follow_uid=profile.uid,
+                source_nickname=profile.nickname,
+                last_status=existing.last_status if existing is not None else "Following sync",
+            )
+
+        removed = self.repo.delete_following_sync_profiles(
+            fetch_result.source_account_sec_uid,
+            current_sec_uids,
+        )
+        self.repo.set_setting("following_sync_source_account", source_account.strip())
+        self.repo.set_setting("following_sync_source_account_sec_uid", fetch_result.source_account_sec_uid)
+        self.repo.set_setting("following_sync_last_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+        return FollowingSyncResult(
+            source_account_sec_uid=fetch_result.source_account_sec_uid,
+            fetched=len(fetch_result.profiles),
+            added=added,
+            updated=updated,
+            removed=removed,
+            skipped=skipped,
+        )
 
     @staticmethod
     def _none_if_empty(value: object) -> str | None:

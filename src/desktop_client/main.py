@@ -39,7 +39,9 @@ from .live_capture import MonitorEvent
 from .i18n import TranslationCatalog, normalize_language
 from .models import (
     DesktopAnalysisRequest,
+    FollowingSyncResult,
     MonitorProfileRecord,
+    MonitorProfileSource,
     WorkflowSnapshot,
     WorkflowStage,
     WorkflowStatus,
@@ -171,6 +173,33 @@ class MonitorWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class FollowingSyncWorker(QThread):
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, monitor_profiles: MonitorProfileService, source_account: str) -> None:
+        super().__init__()
+        self.monitor_profiles = monitor_profiles
+        self.source_account = source_account
+
+    def run(self) -> None:
+        try:
+            result = self.monitor_profiles.sync_following_profiles(self.source_account)
+            self.finished_ok.emit(
+                {
+                    "source_account_sec_uid": result.source_account_sec_uid,
+                    "fetched": result.fetched,
+                    "added": result.added,
+                    "updated": result.updated,
+                    "removed": result.removed,
+                    "skipped": result.skipped,
+                    "error": result.error or "",
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     MONITOR_URL_ROLE = Qt.ItemDataRole.UserRole
     OUTPUT_KEY_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -183,10 +212,11 @@ class MainWindow(QMainWindow):
         repo = ClientJobRepository(settings.sqlite_path)
         self.repo = repo
         self.workflow = DesktopWorkflowService(settings, repo)
-        self.monitor_profiles = MonitorProfileService(repo)
+        self.monitor_profiles = MonitorProfileService(repo, settings)
         self.worker: AnalysisWorker | None = None
         self.capture_worker: CaptureWorker | None = None
         self.monitor_worker: MonitorWorker | None = None
+        self.following_sync_worker: FollowingSyncWorker | None = None
         self.f2_report = self.workflow.probe_f2_runtime()
         self.current_language = self._load_language_preference()
         self.current_theme_mode = self._load_theme_mode_preference()
@@ -487,6 +517,18 @@ class MainWindow(QMainWindow):
         self.notification_cooldown_label.setText(self._lang_text("告警冷却(分钟)", "Alert Cooldown (min)"))
         self.notification_save_button.setText(self._lang_text("保存告警配置", "Save Alert Settings"))
 
+    def _refresh_following_sync_labels(self) -> None:
+        self.following_source_label.setText(self._lang_text("关注来源账号", "Following Source"))
+        self.following_sync_button.setText(self._lang_text("同步关注列表", "Sync Following List"))
+        self.following_source_input.setPlaceholderText(
+            self._lang_text("抖音主页链接或 sec_uid", "Douyin profile URL or sec_uid")
+        )
+
+    def _source_label(self, source_type: str | None) -> str:
+        if source_type == MonitorProfileSource.FOLLOWING_SYNC.value:
+            return self._lang_text("关注同步", "Following Sync")
+        return self._lang_text("手动", "Manual")
+
     def _refresh_translations(self) -> None:
         self.setWindowTitle(self._window_title_text())
         self.header_title.setText(self._window_title_text())
@@ -539,6 +581,8 @@ class MainWindow(QMainWindow):
             self.monitor_button.setText(self._tr("monitor_start_button"))
             self.save_monitor_button.setText(self._tr("monitor_save_button"))
             self.stop_monitor_button.setText(self._tr("monitor_stop_button"))
+        if hasattr(self, "following_sync_button"):
+            self._refresh_following_sync_labels()
         self.replay_browse_button.setText(self._tr("browse_button"))
         self.occupancy_browse_button.setText(self._tr("browse_button"))
         self.danmaku_browse_button.setText(self._tr("browse_button"))
@@ -547,6 +591,7 @@ class MainWindow(QMainWindow):
                 [
                     self._tr("monitor_headers_enabled"),
                     self._tr("monitor_headers_url"),
+                    self._lang_text("来源", "Source"),
                     self._tr("monitor_headers_status"),
                     self._tr("monitor_headers_last_live"),
                     self._tr("monitor_headers_last_capture"),
@@ -763,12 +808,15 @@ class MainWindow(QMainWindow):
         row.addWidget(self.remove_monitor_button)
         layout.addLayout(row)
 
+        layout.addWidget(self._build_following_sync_group())
+
         self.monitor_tree = QTreeWidget()
-        self.monitor_tree.setColumnCount(5)
+        self.monitor_tree.setColumnCount(6)
         self.monitor_tree.setHeaderLabels(
             [
                 self._tr("monitor_headers_enabled"),
                 self._tr("monitor_headers_url"),
+                self._lang_text("来源", "Source"),
                 self._tr("monitor_headers_status"),
                 self._tr("monitor_headers_last_live"),
                 self._tr("monitor_headers_last_capture"),
@@ -798,6 +846,32 @@ class MainWindow(QMainWindow):
         layout.addLayout(footer)
         layout.addWidget(self._build_notification_group())
         return group
+
+    def _build_following_sync_group(self) -> QWidget:
+        box = self._build_card()
+        layout = QFormLayout(box)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+        self.following_source_label = QLabel()
+        self.following_source_input = QLineEdit()
+        self.following_source_input.setText(str(self.repo.get_setting("following_sync_source_account", "") or ""))
+        self.following_source_input.setPlaceholderText(
+            self._lang_text("抖音主页链接或 sec_uid", "Douyin profile URL or sec_uid")
+        )
+        self.following_sync_button = QPushButton()
+        self.following_sync_button.setProperty("variant", "ghost")
+        self.following_sync_button.clicked.connect(self._sync_following_profiles)
+        self.following_sync_result_label = QLabel()
+        self.following_sync_result_label.setProperty("role", "muted")
+        self.following_sync_result_label.setWordWrap(True)
+        last_sync = str(self.repo.get_setting("following_sync_last_at", "") or "")
+        if last_sync:
+            self.following_sync_result_label.setText(self._lang_text(f"上次同步: {last_sync}", f"Last sync: {last_sync}"))
+        layout.addRow(self.following_source_label, self.following_source_input)
+        layout.addRow(QWidget(), self.following_sync_button)
+        layout.addRow(QWidget(), self.following_sync_result_label)
+        self._refresh_following_sync_labels()
+        return box
 
     def _build_analysis_provider_group(self) -> QWidget:
         box = self._build_card()
@@ -1030,13 +1104,19 @@ class MainWindow(QMainWindow):
 
     def _record_from_item(self, item: QTreeWidgetItem) -> MonitorProfileRecord:
         profile_url = str(item.data(1, self.MONITOR_URL_ROLE) or item.text(1)).strip()
+        source_type = str(item.data(2, self.MONITOR_URL_ROLE) or MonitorProfileSource.MANUAL.value)
         return MonitorProfileRecord(
             profile_url=profile_url,
             enabled=item.checkState(0) == Qt.CheckState.Checked,
-            last_status=None if item.text(2) in {"", "-"} else item.text(2),
-            last_live_at=None if item.text(3) in {"", "-"} else item.text(3),
-            last_capture_dir=None if item.text(4) in {"", "-"} else item.text(4),
+            last_status=None if item.text(3) in {"", "-"} else item.text(3),
+            last_live_at=None if item.text(4) in {"", "-"} else item.text(4),
+            last_capture_dir=None if item.text(5) in {"", "-"} else item.text(5),
             last_room_id=None,
+            source_type=source_type,
+            source_account_sec_uid=str(item.data(2, self.OUTPUT_KEY_ROLE) or "") or None,
+            source_follow_sec_uid=str(item.data(3, self.OUTPUT_KEY_ROLE) or "") or None,
+            source_follow_uid=str(item.data(4, self.OUTPUT_KEY_ROLE) or "") or None,
+            source_nickname=str(item.data(5, self.OUTPUT_KEY_ROLE) or "") or None,
         )
 
     def _item_for_profile(self, profile_url: str) -> QTreeWidgetItem | None:
@@ -1052,9 +1132,15 @@ class MainWindow(QMainWindow):
         item.setCheckState(0, Qt.CheckState.Checked if profile.enabled else Qt.CheckState.Unchecked)
         item.setText(1, profile.profile_url)
         item.setData(1, self.MONITOR_URL_ROLE, profile.profile_url)
-        item.setText(2, self._fmt_optional(profile.last_status))
-        item.setText(3, self._fmt_optional(profile.last_live_at))
-        item.setText(4, self._fmt_optional(profile.last_capture_dir))
+        item.setText(2, self._source_label(profile.source_type))
+        item.setData(2, self.MONITOR_URL_ROLE, profile.source_type)
+        item.setData(2, self.OUTPUT_KEY_ROLE, profile.source_account_sec_uid or "")
+        item.setText(3, self._fmt_optional(profile.last_status))
+        item.setData(3, self.OUTPUT_KEY_ROLE, profile.source_follow_sec_uid or "")
+        item.setText(4, self._fmt_optional(profile.last_live_at))
+        item.setData(4, self.OUTPUT_KEY_ROLE, profile.source_follow_uid or "")
+        item.setText(5, self._fmt_optional(profile.last_capture_dir))
+        item.setData(5, self.OUTPUT_KEY_ROLE, profile.source_nickname or "")
         return item
 
     def _collect_monitor_profiles(self) -> list[MonitorProfileRecord]:
@@ -1069,7 +1155,7 @@ class MainWindow(QMainWindow):
         for profile in profiles:
             self.monitor_tree.addTopLevelItem(self._build_monitor_item(profile))
         self.monitor_tree.blockSignals(False)
-        for column in range(5):
+        for column in range(6):
             self.monitor_tree.resizeColumnToContents(column)
 
     def _upsert_monitor_item(self, profile: MonitorProfileRecord) -> None:
@@ -1079,9 +1165,15 @@ class MainWindow(QMainWindow):
             return
         self.monitor_tree.blockSignals(True)
         item.setCheckState(0, Qt.CheckState.Checked if profile.enabled else Qt.CheckState.Unchecked)
-        item.setText(2, self._fmt_optional(profile.last_status))
-        item.setText(3, self._fmt_optional(profile.last_live_at))
-        item.setText(4, self._fmt_optional(profile.last_capture_dir))
+        item.setText(2, self._source_label(profile.source_type))
+        item.setData(2, self.MONITOR_URL_ROLE, profile.source_type)
+        item.setData(2, self.OUTPUT_KEY_ROLE, profile.source_account_sec_uid or "")
+        item.setText(3, self._fmt_optional(profile.last_status))
+        item.setData(3, self.OUTPUT_KEY_ROLE, profile.source_follow_sec_uid or "")
+        item.setText(4, self._fmt_optional(profile.last_live_at))
+        item.setData(4, self.OUTPUT_KEY_ROLE, profile.source_follow_uid or "")
+        item.setText(5, self._fmt_optional(profile.last_capture_dir))
+        item.setData(5, self.OUTPUT_KEY_ROLE, profile.source_nickname or "")
         self.monitor_tree.blockSignals(False)
 
     def _load_monitor_profiles(self) -> None:
@@ -1097,6 +1189,52 @@ class MainWindow(QMainWindow):
         self.monitor_profiles.save_profiles(profiles)
         self._set_notice(self._tr("saved_monitor_profiles", count=len(profiles)), WorkflowStatus.SUCCESS)
         self._append_log(self._tr("saved_monitor_profiles_log", count=len(profiles)))
+
+    def _sync_following_profiles(self) -> None:
+        source_account = self.following_source_input.text().strip()
+        if not source_account:
+            self._set_notice(
+                self._lang_text("请先填写关注来源账号。", "Fill in a following source account first."),
+                WorkflowStatus.WARNING,
+            )
+            return
+        self.following_sync_button.setEnabled(False)
+        self.following_sync_result_label.setText(self._lang_text("正在同步关注列表...", "Syncing following list..."))
+        self._append_log(self._lang_text("开始同步关注列表。", "Starting following list sync."))
+        self.following_sync_worker = FollowingSyncWorker(self.monitor_profiles, source_account)
+        self.following_sync_worker.finished_ok.connect(self._on_following_sync_finished)
+        self.following_sync_worker.failed.connect(self._on_following_sync_failed)
+        self.following_sync_worker.start()
+
+    def _on_following_sync_finished(self, payload: dict) -> None:
+        self.following_sync_button.setEnabled(True)
+        profiles = self.monitor_profiles.list_profiles()
+        self._replace_monitor_tree(profiles)
+        summary = self._lang_text(
+            (
+                f"关注同步完成: 拉取 {payload.get('fetched')}，新增 {payload.get('added')}，"
+                f"更新 {payload.get('updated')}，移除 {payload.get('removed')}，跳过 {payload.get('skipped')}。"
+            ),
+            (
+                f"Following sync completed: fetched {payload.get('fetched')}, added {payload.get('added')}, "
+                f"updated {payload.get('updated')}, removed {payload.get('removed')}, skipped {payload.get('skipped')}."
+            ),
+        )
+        self.following_sync_result_label.setText(summary)
+        self._append_log(summary)
+        self._set_notice(summary, WorkflowStatus.SUCCESS)
+        self._sync_buttons()
+
+    def _on_following_sync_failed(self, message: str) -> None:
+        self.following_sync_button.setEnabled(True)
+        summary = self._lang_text(
+            f"关注同步失败，已保留现有监控列表: {message}",
+            f"Following sync failed; existing monitor list was preserved: {message}",
+        )
+        self.following_sync_result_label.setText(summary)
+        self._append_log(summary)
+        self._set_notice(summary, WorkflowStatus.ERROR)
+        self._sync_buttons()
 
     def _on_save_notification_settings(self) -> None:
         config = self._save_notification_config()
@@ -1535,6 +1673,7 @@ class MainWindow(QMainWindow):
         capture_running = bool(self.capture_worker and self.capture_worker.isRunning())
         analysis_running = bool(self.worker and self.worker.isRunning())
         monitor_running = bool(self.monitor_worker and self.monitor_worker.isRunning())
+        following_sync_running = bool(self.following_sync_worker and self.following_sync_worker.isRunning())
         if hasattr(self, "capture_button"):
             self.capture_button.setEnabled(not capture_running and not analysis_running)
         if hasattr(self, "stop_capture_button"):
@@ -1545,6 +1684,8 @@ class MainWindow(QMainWindow):
             self.monitor_button.setEnabled(not monitor_running and not capture_running)
         if hasattr(self, "stop_monitor_button"):
             self.stop_monitor_button.setEnabled(monitor_running)
+        if hasattr(self, "following_sync_button"):
+            self.following_sync_button.setEnabled(not following_sync_running and not monitor_running)
 
 
 def main(app_mode: str = "all", *, auto_start_monitor: bool | None = None) -> int:
