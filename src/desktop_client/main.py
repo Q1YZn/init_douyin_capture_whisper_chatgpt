@@ -217,6 +217,7 @@ class MainWindow(QMainWindow):
         self.capture_worker: CaptureWorker | None = None
         self.monitor_worker: MonitorWorker | None = None
         self.following_sync_worker: FollowingSyncWorker | None = None
+        self.start_monitor_after_following_sync = False
         self.f2_report = self.workflow.probe_f2_runtime()
         self.current_language = self._load_language_preference()
         self.current_theme_mode = self._load_theme_mode_preference()
@@ -485,6 +486,8 @@ class MainWindow(QMainWindow):
 
     def _refresh_analysis_provider_labels(self) -> None:
         self.analysis_provider_label.setText(self._lang_text("分析模型", "Analysis Provider"))
+        if hasattr(self, "analysis_advanced_toggle"):
+            self.analysis_advanced_toggle.setText(self._tr("analysis_advanced_toggle"))
         self.analysis_provider_combo.blockSignals(True)
         self.analysis_provider_combo.setItemText(
             0,
@@ -503,6 +506,8 @@ class MainWindow(QMainWindow):
         self.analysis_model_label.setText(self._lang_text("模型名称", "Model ID"))
 
     def _refresh_notification_labels(self) -> None:
+        if hasattr(self, "notification_advanced_toggle"):
+            self.notification_advanced_toggle.setText(self._tr("notification_advanced_toggle"))
         self.notification_provider_label.setText(self._lang_text("机器人通知", "Robot Notification"))
         self.notification_provider_combo.blockSignals(True)
         self.notification_provider_combo.setItemText(0, self._notification_provider_display("none"))
@@ -518,16 +523,16 @@ class MainWindow(QMainWindow):
         self.notification_save_button.setText(self._lang_text("保存告警配置", "Save Alert Settings"))
 
     def _refresh_following_sync_labels(self) -> None:
-        self.following_source_label.setText(self._lang_text("关注来源账号", "Following Source"))
-        self.following_sync_button.setText(self._lang_text("同步关注列表", "Sync Following List"))
-        self.following_source_input.setPlaceholderText(
-            self._lang_text("抖音主页链接或 sec_uid", "Douyin profile URL or sec_uid")
-        )
+        self.following_source_label.setText(self._tr("following_source_label"))
+        self.following_sync_button.setText(self._tr("following_sync_button"))
+        self.following_sync_start_button.setText(self._tr("following_sync_start_button"))
+        self.following_source_input.setPlaceholderText(self._tr("following_source_placeholder"))
+        self.following_hint.setText(self._tr("following_hint"))
 
     def _source_label(self, source_type: str | None) -> str:
         if source_type == MonitorProfileSource.FOLLOWING_SYNC.value:
-            return self._lang_text("关注同步", "Following Sync")
-        return self._lang_text("手动", "Manual")
+            return self._tr("source_following_sync")
+        return self._tr("source_manual")
 
     def _refresh_translations(self) -> None:
         self.setWindowTitle(self._window_title_text())
@@ -570,12 +575,14 @@ class MainWindow(QMainWindow):
         self.occupancy_label.setText(self._tr("occupancy_label"))
         self.danmaku_label.setText(self._tr("danmaku_label"))
         self.room_input.setPlaceholderText(self._tr("live_target_placeholder"))
-        self.monitor_url_input.setPlaceholderText(self._tr("monitor_url_placeholder"))
+        if hasattr(self, "monitor_url_input"):
+            self.monitor_url_input.setPlaceholderText(self._tr("monitor_url_placeholder"))
         self.capture_hint.setText(self._tr("capture_hint"))
         self.capture_button.setText(self._tr("capture_button"))
         self.stop_capture_button.setText(self._tr("stop_capture_button"))
         self.run_button.setText(self._tr("run_analysis_button"))
         if hasattr(self, "add_monitor_button"):
+            self.manual_monitor_toggle.setText(self._tr("manual_monitor_toggle"))
             self.add_monitor_button.setText(self._tr("add_profile_button"))
             self.remove_monitor_button.setText(self._tr("remove_selected_button"))
             self.monitor_button.setText(self._tr("monitor_start_button"))
@@ -591,7 +598,7 @@ class MainWindow(QMainWindow):
                 [
                     self._tr("monitor_headers_enabled"),
                     self._tr("monitor_headers_url"),
-                    self._lang_text("来源", "Source"),
+                    self._tr("monitor_headers_source"),
                     self._tr("monitor_headers_status"),
                     self._tr("monitor_headers_last_live"),
                     self._tr("monitor_headers_last_capture"),
@@ -795,6 +802,15 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(group)
         layout.setSpacing(12)
 
+        layout.addWidget(self._build_following_sync_group())
+
+        self.manual_monitor_toggle = QPushButton(self._tr("manual_monitor_toggle"))
+        self.manual_monitor_toggle.setCheckable(True)
+        self.manual_monitor_toggle.setProperty("variant", "ghost")
+        layout.addWidget(self.manual_monitor_toggle)
+
+        self.manual_monitor_widget = QWidget()
+        self.manual_monitor_widget.setVisible(False)
         row = QHBoxLayout()
         self.monitor_url_input = QLineEdit()
         self.monitor_url_input.setPlaceholderText(self._tr("monitor_url_placeholder"))
@@ -806,9 +822,9 @@ class MainWindow(QMainWindow):
         row.addWidget(self.monitor_url_input, 1)
         row.addWidget(self.add_monitor_button)
         row.addWidget(self.remove_monitor_button)
-        layout.addLayout(row)
-
-        layout.addWidget(self._build_following_sync_group())
+        self.manual_monitor_widget.setLayout(row)
+        self.manual_monitor_toggle.toggled.connect(self.manual_monitor_widget.setVisible)
+        layout.addWidget(self.manual_monitor_widget)
 
         self.monitor_tree = QTreeWidget()
         self.monitor_tree.setColumnCount(6)
@@ -816,7 +832,7 @@ class MainWindow(QMainWindow):
             [
                 self._tr("monitor_headers_enabled"),
                 self._tr("monitor_headers_url"),
-                self._lang_text("来源", "Source"),
+                self._tr("monitor_headers_source"),
                 self._tr("monitor_headers_status"),
                 self._tr("monitor_headers_last_live"),
                 self._tr("monitor_headers_last_capture"),
@@ -836,6 +852,7 @@ class MainWindow(QMainWindow):
         self.save_monitor_button = QPushButton(self._tr("monitor_save_button"))
         self.save_monitor_button.setProperty("variant", "ghost")
         self.save_monitor_button.clicked.connect(self._save_monitor_profiles)
+        self.save_monitor_button.hide()
         self.stop_monitor_button = QPushButton(self._tr("monitor_stop_button"))
         self.stop_monitor_button.setProperty("variant", "ghost")
         self.stop_monitor_button.clicked.connect(self._stop_monitor)
@@ -849,40 +866,59 @@ class MainWindow(QMainWindow):
 
     def _build_following_sync_group(self) -> QWidget:
         box = self._build_card()
-        layout = QFormLayout(box)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
+        layout = QFormLayout()
+        layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.following_source_label = QLabel()
         self.following_source_input = QLineEdit()
         self.following_source_input.setText(str(self.repo.get_setting("following_sync_source_account", "") or ""))
-        self.following_source_input.setPlaceholderText(
-            self._lang_text("抖音主页链接或 sec_uid", "Douyin profile URL or sec_uid")
-        )
+        self.following_source_input.setPlaceholderText(self._tr("following_source_placeholder"))
         self.following_sync_button = QPushButton()
         self.following_sync_button.setProperty("variant", "ghost")
-        self.following_sync_button.clicked.connect(self._sync_following_profiles)
+        self.following_sync_button.clicked.connect(lambda: self._sync_following_profiles(False))
+        self.following_sync_start_button = QPushButton()
+        self.following_sync_start_button.clicked.connect(lambda: self._sync_following_profiles(True))
+        self.following_hint = QLabel(self._tr("following_hint"))
+        self.following_hint.setProperty("role", "muted")
+        self.following_hint.setWordWrap(True)
         self.following_sync_result_label = QLabel()
         self.following_sync_result_label.setProperty("role", "muted")
         self.following_sync_result_label.setWordWrap(True)
         last_sync = str(self.repo.get_setting("following_sync_last_at", "") or "")
         if last_sync:
-            self.following_sync_result_label.setText(self._lang_text(f"上次同步: {last_sync}", f"Last sync: {last_sync}"))
+            self.following_sync_result_label.setText(self._tr("following_last_sync", time=last_sync))
         layout.addRow(self.following_source_label, self.following_source_input)
-        layout.addRow(QWidget(), self.following_sync_button)
-        layout.addRow(QWidget(), self.following_sync_result_label)
+        actions = QHBoxLayout()
+        actions.addWidget(self.following_sync_start_button, 2)
+        actions.addWidget(self.following_sync_button, 1)
+        layout.addRow(QWidget(), self._wrap_layout(actions))
+        outer.addLayout(layout)
+        outer.addWidget(self.following_hint)
+        outer.addWidget(self.following_sync_result_label)
         self._refresh_following_sync_labels()
         return box
 
     def _build_analysis_provider_group(self) -> QWidget:
         box = self._build_card()
-        layout = QFormLayout(box)
-        layout.setContentsMargins(12, 12, 12, 12)
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
+        layout = QFormLayout()
         layout.setSpacing(10)
         self.analysis_provider_label = QLabel()
         self.analysis_provider_combo = QComboBox()
         self.analysis_provider_combo.addItem("", OPENAI_COMPATIBLE_PROVIDER)
         self.analysis_provider_combo.addItem("", DEEPSEEK_PROVIDER)
         self.analysis_provider_combo.currentIndexChanged.connect(self._on_analysis_provider_changed)
+        self.analysis_advanced_toggle = QPushButton()
+        self.analysis_advanced_toggle.setCheckable(True)
+        self.analysis_advanced_toggle.setProperty("variant", "ghost")
+        self.analysis_advanced_frame = QWidget()
+        advanced_layout = QFormLayout(self.analysis_advanced_frame)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(10)
         self.analysis_base_url_label = QLabel()
         self.analysis_base_url_input = QLineEdit()
         self.analysis_api_key_label = QLabel()
@@ -891,17 +927,29 @@ class MainWindow(QMainWindow):
         self.analysis_model_label = QLabel()
         self.analysis_model_input = QLineEdit()
         layout.addRow(self.analysis_provider_label, self.analysis_provider_combo)
-        layout.addRow(self.analysis_base_url_label, self.analysis_base_url_input)
-        layout.addRow(self.analysis_api_key_label, self.analysis_api_key_input)
-        layout.addRow(self.analysis_model_label, self.analysis_model_input)
+        advanced_layout.addRow(self.analysis_base_url_label, self.analysis_base_url_input)
+        advanced_layout.addRow(self.analysis_api_key_label, self.analysis_api_key_input)
+        advanced_layout.addRow(self.analysis_model_label, self.analysis_model_input)
+        self.analysis_advanced_frame.setVisible(False)
+        self.analysis_advanced_toggle.toggled.connect(self.analysis_advanced_frame.setVisible)
+        outer.addLayout(layout)
+        outer.addWidget(self.analysis_advanced_toggle)
+        outer.addWidget(self.analysis_advanced_frame)
         self._refresh_analysis_provider_labels()
         self._load_analysis_provider_settings()
         return box
 
     def _build_notification_group(self) -> QWidget:
         box = self._build_card()
-        layout = QFormLayout(box)
-        layout.setContentsMargins(12, 12, 12, 12)
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
+        self.notification_advanced_toggle = QPushButton()
+        self.notification_advanced_toggle.setCheckable(True)
+        self.notification_advanced_toggle.setProperty("variant", "ghost")
+        self.notification_content = QWidget()
+        layout = QFormLayout(self.notification_content)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         self.notification_provider_label = QLabel()
         self.notification_provider_combo = QComboBox()
@@ -927,6 +975,11 @@ class MainWindow(QMainWindow):
         layout.addRow(self.notification_cooldown_label, self.notification_cooldown_spin)
         layout.addRow(QWidget(), self.notification_save_button)
         config = self._load_notification_config()
+        self.notification_content.setVisible(config.provider != "none" or bool(config.webhook_url))
+        self.notification_advanced_toggle.setChecked(self.notification_content.isVisible())
+        self.notification_advanced_toggle.toggled.connect(self.notification_content.setVisible)
+        outer.addWidget(self.notification_advanced_toggle)
+        outer.addWidget(self.notification_content)
         self.notification_provider_combo.setCurrentIndex(max(self.notification_provider_combo.findData(config.provider), 0))
         self.notification_webhook_input.setText(config.webhook_url)
         self.memory_threshold_spin.setValue(config.memory_threshold_mb)
@@ -1015,6 +1068,12 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
         layout.addWidget(line_edit, 1)
         layout.addWidget(button)
+        return row
+
+    def _wrap_layout(self, source_layout: QHBoxLayout | QVBoxLayout) -> QWidget:
+        row = QWidget()
+        row.setLayout(source_layout)
+        source_layout.setContentsMargins(0, 0, 0, 0)
         return row
 
     def _set_mono_fonts(self) -> None:
@@ -1190,17 +1249,20 @@ class MainWindow(QMainWindow):
         self._set_notice(self._tr("saved_monitor_profiles", count=len(profiles)), WorkflowStatus.SUCCESS)
         self._append_log(self._tr("saved_monitor_profiles_log", count=len(profiles)))
 
-    def _sync_following_profiles(self) -> None:
+    def _sync_following_profiles(self, start_monitor_after: bool = False) -> None:
         source_account = self.following_source_input.text().strip()
         if not source_account:
             self._set_notice(
-                self._lang_text("请先填写关注来源账号。", "Fill in a following source account first."),
+                self._tr("following_missing_source"),
                 WorkflowStatus.WARNING,
             )
             return
+        self.start_monitor_after_following_sync = start_monitor_after
         self.following_sync_button.setEnabled(False)
-        self.following_sync_result_label.setText(self._lang_text("正在同步关注列表...", "Syncing following list..."))
-        self._append_log(self._lang_text("开始同步关注列表。", "Starting following list sync."))
+        self.following_sync_start_button.setEnabled(False)
+        message_key = "following_sync_starting" if start_monitor_after else "following_syncing"
+        self.following_sync_result_label.setText(self._tr(message_key))
+        self._append_log(self._tr("following_sync_log"))
         self.following_sync_worker = FollowingSyncWorker(self.monitor_profiles, source_account)
         self.following_sync_worker.finished_ok.connect(self._on_following_sync_finished)
         self.following_sync_worker.failed.connect(self._on_following_sync_failed)
@@ -1208,29 +1270,31 @@ class MainWindow(QMainWindow):
 
     def _on_following_sync_finished(self, payload: dict) -> None:
         self.following_sync_button.setEnabled(True)
+        self.following_sync_start_button.setEnabled(True)
         profiles = self.monitor_profiles.list_profiles()
         self._replace_monitor_tree(profiles)
-        summary = self._lang_text(
-            (
-                f"关注同步完成: 拉取 {payload.get('fetched')}，新增 {payload.get('added')}，"
-                f"更新 {payload.get('updated')}，移除 {payload.get('removed')}，跳过 {payload.get('skipped')}。"
-            ),
-            (
-                f"Following sync completed: fetched {payload.get('fetched')}, added {payload.get('added')}, "
-                f"updated {payload.get('updated')}, removed {payload.get('removed')}, skipped {payload.get('skipped')}."
-            ),
+        summary = self._tr(
+            "following_sync_done",
+            fetched=payload.get("fetched"),
+            added=payload.get("added"),
+            updated=payload.get("updated"),
+            removed=payload.get("removed"),
+            skipped=payload.get("skipped"),
         )
         self.following_sync_result_label.setText(summary)
         self._append_log(summary)
         self._set_notice(summary, WorkflowStatus.SUCCESS)
         self._sync_buttons()
+        should_start_monitor = self.start_monitor_after_following_sync
+        self.start_monitor_after_following_sync = False
+        if should_start_monitor:
+            QTimer.singleShot(0, self._start_monitor)
 
     def _on_following_sync_failed(self, message: str) -> None:
         self.following_sync_button.setEnabled(True)
-        summary = self._lang_text(
-            f"关注同步失败，已保留现有监控列表: {message}",
-            f"Following sync failed; existing monitor list was preserved: {message}",
-        )
+        self.following_sync_start_button.setEnabled(True)
+        self.start_monitor_after_following_sync = False
+        summary = self._tr("following_sync_failed", message=message)
         self.following_sync_result_label.setText(summary)
         self._append_log(summary)
         self._set_notice(summary, WorkflowStatus.ERROR)
@@ -1686,6 +1750,8 @@ class MainWindow(QMainWindow):
             self.stop_monitor_button.setEnabled(monitor_running)
         if hasattr(self, "following_sync_button"):
             self.following_sync_button.setEnabled(not following_sync_running and not monitor_running)
+        if hasattr(self, "following_sync_start_button"):
+            self.following_sync_start_button.setEnabled(not following_sync_running and not monitor_running)
 
 
 def main(app_mode: str = "all", *, auto_start_monitor: bool | None = None) -> int:
