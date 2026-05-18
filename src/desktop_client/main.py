@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime
 
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QProgressBar,
+    QSpinBox,
     QSplitter,
     QTreeWidget,
     QTreeWidgetItem,
@@ -42,8 +44,26 @@ from .models import (
     WorkflowStage,
     WorkflowStatus,
 )
+from .notifications import MemoryPressureWatcher, RobotNotificationConfig, RobotNotifier
 from .services import DesktopWorkflowService, MonitorProfileService
 from .ui_tokens import build_app_stylesheet, get_tokens
+
+
+OPENAI_COMPATIBLE_PROVIDER = "openai_compatible"
+DEEPSEEK_PROVIDER = "deepseek"
+
+ANALYSIS_PROVIDER_PRESETS: dict[str, dict[str, str]] = {
+    OPENAI_COMPATIBLE_PROVIDER: {
+        "base_url": "http://127.0.0.1:8317/v1",
+        "model_id": "gpt-5.4",
+        "api_key_env": "OPENAI_API_KEY",
+    },
+    DEEPSEEK_PROVIDER: {
+        "base_url": "https://api.deepseek.com",
+        "model_id": "deepseek-v4-pro",
+        "api_key_env": "DEEPSEEK_API_KEY",
+    },
+}
 
 
 class AnalysisWorker(QThread):
@@ -155,8 +175,10 @@ class MainWindow(QMainWindow):
     MONITOR_URL_ROLE = Qt.ItemDataRole.UserRole
     OUTPUT_KEY_ROLE = Qt.ItemDataRole.UserRole + 1
 
-    def __init__(self) -> None:
+    def __init__(self, app_mode: str = "all", *, auto_start_monitor: bool | None = None) -> None:
         super().__init__()
+        self.app_mode = app_mode
+        self.auto_start_monitor = (app_mode == "capture") if auto_start_monitor is None else auto_start_monitor
         settings = DesktopSettings.from_env()
         repo = ClientJobRepository(settings.sqlite_path)
         self.repo = repo
@@ -168,8 +190,14 @@ class MainWindow(QMainWindow):
         self.f2_report = self.workflow.probe_f2_runtime()
         self.current_language = self._load_language_preference()
         self.current_theme_mode = self._load_theme_mode_preference()
+        self.current_analysis_provider = self._load_analysis_provider_preference()
         self.catalog = TranslationCatalog(self.current_language)
         self.tokens = get_tokens(self._resolve_color_scheme())
+        self.robot_notifier = RobotNotifier()
+        self.memory_watcher = MemoryPressureWatcher()
+        self.memory_timer = QTimer(self)
+        self.memory_timer.setInterval(60_000)
+        self.memory_timer.timeout.connect(self._check_memory_pressure)
         self.current_snapshot = WorkflowSnapshot(
             title=self._tr("ready").rstrip("."),
             stage=WorkflowStage.IDLE,
@@ -189,10 +217,12 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.styleHints().colorSchemeChanged.connect(self._on_system_color_scheme_changed)
+        if self._supports_capture_mode():
+            self.memory_timer.start()
         QTimer.singleShot(0, self._maybe_prompt_start_saved_monitor)
 
     def _build_ui(self) -> None:
-        self.setWindowTitle(self._tr("app_title"))
+        self.setWindowTitle(self._window_title_text())
         central = QWidget()
         root = QVBoxLayout(central)
         root.setContentsMargins(20, 20, 20, 20)
@@ -214,6 +244,35 @@ class MainWindow(QMainWindow):
     def _tr(self, key: str, **kwargs: object) -> str:
         return self.catalog.text(key, **kwargs)
 
+    def _lang_text(self, zh_text: str, en_text: str) -> str:
+        return zh_text if self.current_language == "zh_CN" else en_text
+
+    def _supports_capture_mode(self) -> bool:
+        return self.app_mode in {"all", "capture"}
+
+    def _supports_analysis_mode(self) -> bool:
+        return self.app_mode in {"all", "analyzer"}
+
+    def _window_title_text(self) -> str:
+        if self.app_mode == "capture":
+            return self._lang_text("抖音录播采集端", "Douyin Capture Client")
+        if self.app_mode == "analyzer":
+            return self._lang_text("抖音视频分析端", "Douyin Analyzer Client")
+        return self._tr("app_title")
+
+    def _window_subtitle_text(self) -> str:
+        if self.app_mode == "capture":
+            return self._lang_text(
+                "无人值守监控直播并落地录播、人数与弹幕文件。",
+                "Unattended live monitoring with replay, occupancy, and danmaku capture.",
+            )
+        if self.app_mode == "analyzer":
+            return self._lang_text(
+                "导入视频与结构化文件，透传到兼容 OpenAI / DeepSeek 的分析模型。",
+                "Import video and structured files, then pass through to OpenAI-compatible or DeepSeek analysis.",
+            )
+        return self._tr("app_subtitle")
+
     def _load_language_preference(self) -> str:
         saved = self.repo.get_setting("ui_language")
         if saved:
@@ -230,6 +289,12 @@ class MainWindow(QMainWindow):
     def _load_theme_mode_preference(self) -> str:
         saved = self.repo.get_setting("ui_theme_mode")
         return self._normalize_theme_mode(saved)
+
+    def _load_analysis_provider_preference(self) -> str:
+        saved = str(self.repo.get_setting("analysis_provider") or "").strip().lower()
+        if saved in ANALYSIS_PROVIDER_PRESETS:
+            return saved
+        return DEEPSEEK_PROVIDER if self.app_mode == "analyzer" else OPENAI_COMPATIBLE_PROVIDER
 
     def _resolve_system_color_scheme(self) -> str:
         app = QApplication.instance()
@@ -288,10 +353,144 @@ class MainWindow(QMainWindow):
         self.repo.set_setting("ui_theme_mode", normalized)
         self._apply_theme()
 
+    def _analysis_preset(self, provider: str) -> dict[str, str]:
+        preset = ANALYSIS_PROVIDER_PRESETS.get(provider, ANALYSIS_PROVIDER_PRESETS[OPENAI_COMPATIBLE_PROVIDER]).copy()
+        env_key = preset.get("api_key_env", "")
+        if env_key:
+            preset["api_key"] = os.getenv(env_key, "")
+        if provider == DEEPSEEK_PROVIDER:
+            preset["model_id"] = os.getenv("DEEPSEEK_MODEL_ID", preset["model_id"])
+            preset["base_url"] = os.getenv("DEEPSEEK_BASE_URL", preset["base_url"])
+        else:
+            preset["base_url"] = os.getenv("OPENAI_BASE_URL", preset["base_url"])
+            preset["model_id"] = os.getenv("OPENAI_CHAT_MODEL_ID", preset["model_id"])
+        return preset
+
+    def _analysis_provider_display(self, provider: str) -> str:
+        if provider == DEEPSEEK_PROVIDER:
+            return self._lang_text("DeepSeek 直连", "DeepSeek Direct")
+        return self._lang_text("OpenAI 兼容代理", "OpenAI-Compatible Proxy")
+
+    def _notification_provider_display(self, provider: str) -> str:
+        mapping = {
+            "none": self._lang_text("不发送", "Disabled"),
+            "feishu": self._lang_text("飞书机器人", "Feishu Robot"),
+            "dingtalk": self._lang_text("钉钉机器人", "DingTalk Robot"),
+        }
+        return mapping.get(provider, provider)
+
+    def _load_notification_config(self) -> RobotNotificationConfig:
+        provider = str(self.repo.get_setting("capture_notification_provider", "none") or "none").strip().lower()
+        if provider not in {"none", "feishu", "dingtalk"}:
+            provider = "none"
+        webhook_url = str(self.repo.get_setting("capture_notification_webhook", "") or "").strip()
+        threshold_raw = self.repo.get_setting("capture_memory_threshold_mb", 2048)
+        cooldown_raw = self.repo.get_setting("capture_notification_cooldown_minutes", 30)
+        try:
+            threshold = max(int(threshold_raw), 256)
+        except (TypeError, ValueError):
+            threshold = 2048
+        try:
+            cooldown = max(int(cooldown_raw), 1)
+        except (TypeError, ValueError):
+            cooldown = 30
+        return RobotNotificationConfig(
+            provider=provider,
+            webhook_url=webhook_url,
+            memory_threshold_mb=threshold,
+            cooldown_minutes=cooldown,
+        )
+
+    def _save_notification_config(self) -> RobotNotificationConfig:
+        config = self._current_notification_config()
+        self.repo.set_setting("capture_notification_provider", config.provider)
+        self.repo.set_setting("capture_notification_webhook", config.webhook_url)
+        self.repo.set_setting("capture_memory_threshold_mb", config.memory_threshold_mb)
+        self.repo.set_setting("capture_notification_cooldown_minutes", config.cooldown_minutes)
+        return config
+
+    def _current_notification_config(self) -> RobotNotificationConfig:
+        if not hasattr(self, "notification_provider_combo"):
+            return RobotNotificationConfig()
+        return RobotNotificationConfig(
+            provider=str(self.notification_provider_combo.currentData() or "none"),
+            webhook_url=self.notification_webhook_input.text().strip(),
+            memory_threshold_mb=int(self.memory_threshold_spin.value()),
+            cooldown_minutes=int(self.notification_cooldown_spin.value()),
+        )
+
+    def _load_analysis_provider_settings(self) -> None:
+        provider = self.current_analysis_provider
+        preset = self._analysis_preset(provider)
+        base_url = str(self.repo.get_setting("analysis_base_url") or preset["base_url"]).strip()
+        api_key = str(self.repo.get_setting("analysis_api_key") or preset.get("api_key", "")).strip()
+        model_id = str(self.repo.get_setting("analysis_model_id") or preset["model_id"]).strip()
+        self.analysis_provider_combo.blockSignals(True)
+        self.analysis_provider_combo.setCurrentIndex(max(self.analysis_provider_combo.findData(provider), 0))
+        self.analysis_provider_combo.blockSignals(False)
+        self.analysis_base_url_input.setText(base_url)
+        self.analysis_api_key_input.setText(api_key)
+        self.analysis_model_input.setText(model_id)
+
+    def _save_analysis_provider_settings(self) -> None:
+        if not hasattr(self, "analysis_provider_combo"):
+            return
+        provider = str(self.analysis_provider_combo.currentData() or OPENAI_COMPATIBLE_PROVIDER)
+        self.current_analysis_provider = provider
+        self.repo.set_setting("analysis_provider", provider)
+        self.repo.set_setting("analysis_base_url", self.analysis_base_url_input.text().strip())
+        self.repo.set_setting("analysis_api_key", self.analysis_api_key_input.text().strip())
+        self.repo.set_setting("analysis_model_id", self.analysis_model_input.text().strip())
+
+    def _on_analysis_provider_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        provider = str(self.analysis_provider_combo.itemData(index) or OPENAI_COMPATIBLE_PROVIDER)
+        preset = self._analysis_preset(provider)
+        self.current_analysis_provider = provider
+        self.analysis_base_url_input.setText(preset["base_url"])
+        self.analysis_api_key_input.setText(preset.get("api_key", ""))
+        self.analysis_model_input.setText(preset["model_id"])
+        self._save_analysis_provider_settings()
+
+    def _refresh_analysis_provider_labels(self) -> None:
+        self.analysis_provider_label.setText(self._lang_text("分析模型", "Analysis Provider"))
+        self.analysis_provider_combo.blockSignals(True)
+        self.analysis_provider_combo.setItemText(
+            0,
+            self._analysis_provider_display(OPENAI_COMPATIBLE_PROVIDER),
+        )
+        self.analysis_provider_combo.setItemText(
+            1,
+            self._analysis_provider_display(DEEPSEEK_PROVIDER),
+        )
+        current = self.analysis_provider_combo.currentData()
+        if current:
+            self.analysis_provider_combo.setCurrentIndex(max(self.analysis_provider_combo.findData(current), 0))
+        self.analysis_provider_combo.blockSignals(False)
+        self.analysis_base_url_label.setText(self._lang_text("接口地址", "Base URL"))
+        self.analysis_api_key_label.setText(self._lang_text("接口密钥", "API Key"))
+        self.analysis_model_label.setText(self._lang_text("模型名称", "Model ID"))
+
+    def _refresh_notification_labels(self) -> None:
+        self.notification_provider_label.setText(self._lang_text("机器人通知", "Robot Notification"))
+        self.notification_provider_combo.blockSignals(True)
+        self.notification_provider_combo.setItemText(0, self._notification_provider_display("none"))
+        self.notification_provider_combo.setItemText(1, self._notification_provider_display("feishu"))
+        self.notification_provider_combo.setItemText(2, self._notification_provider_display("dingtalk"))
+        current = self.notification_provider_combo.currentData()
+        if current:
+            self.notification_provider_combo.setCurrentIndex(max(self.notification_provider_combo.findData(current), 0))
+        self.notification_provider_combo.blockSignals(False)
+        self.notification_webhook_label.setText(self._lang_text("Webhook 地址", "Webhook URL"))
+        self.memory_threshold_label.setText(self._lang_text("低内存阈值(MB)", "Low Memory Threshold (MB)"))
+        self.notification_cooldown_label.setText(self._lang_text("告警冷却(分钟)", "Alert Cooldown (min)"))
+        self.notification_save_button.setText(self._lang_text("保存告警配置", "Save Alert Settings"))
+
     def _refresh_translations(self) -> None:
-        self.setWindowTitle(self._tr("app_title"))
-        self.header_title.setText(self._tr("app_title"))
-        self.header_subtitle.setText(self._tr("app_subtitle"))
+        self.setWindowTitle(self._window_title_text())
+        self.header_title.setText(self._window_title_text())
+        self.header_subtitle.setText(self._window_subtitle_text())
         self.language_label.setText(self._tr("language_label"))
         self.theme_label.setText(self._tr("theme_mode"))
         current = self.language_combo.currentData()
@@ -309,12 +508,17 @@ class MainWindow(QMainWindow):
         if current_theme:
             self.theme_combo.setCurrentIndex(max(self.theme_combo.findData(current_theme), 0))
         self.theme_combo.blockSignals(False)
+        if hasattr(self, "analysis_provider_label"):
+            self._refresh_analysis_provider_labels()
+        if hasattr(self, "notification_provider_label"):
+            self._refresh_notification_labels()
         self.status_card_eyebrows["mode"].setText(self._tr("status_mode"))
         self.status_card_eyebrows["last_task"].setText(self._tr("status_last_task"))
         self.status_card_eyebrows["asr"].setText(self._tr("status_asr"))
         self.status_card_eyebrows["f2"].setText(self._tr("status_f2"))
         self.capture_group.setTitle(self._tr("capture_group"))
-        self.monitor_group.setTitle(self._tr("monitor_group"))
+        if hasattr(self, "monitor_group"):
+            self.monitor_group.setTitle(self._tr("monitor_group"))
         self.workflow_group.setTitle(self._tr("workflow_group"))
         self.outputs_group.setTitle(self._tr("outputs_group"))
         self.summary_group.setTitle(self._tr("summary_group"))
@@ -329,26 +533,29 @@ class MainWindow(QMainWindow):
         self.capture_button.setText(self._tr("capture_button"))
         self.stop_capture_button.setText(self._tr("stop_capture_button"))
         self.run_button.setText(self._tr("run_analysis_button"))
-        self.add_monitor_button.setText(self._tr("add_profile_button"))
-        self.remove_monitor_button.setText(self._tr("remove_selected_button"))
-        self.monitor_button.setText(self._tr("monitor_start_button"))
-        self.save_monitor_button.setText(self._tr("monitor_save_button"))
-        self.stop_monitor_button.setText(self._tr("monitor_stop_button"))
+        if hasattr(self, "add_monitor_button"):
+            self.add_monitor_button.setText(self._tr("add_profile_button"))
+            self.remove_monitor_button.setText(self._tr("remove_selected_button"))
+            self.monitor_button.setText(self._tr("monitor_start_button"))
+            self.save_monitor_button.setText(self._tr("monitor_save_button"))
+            self.stop_monitor_button.setText(self._tr("monitor_stop_button"))
         self.replay_browse_button.setText(self._tr("browse_button"))
         self.occupancy_browse_button.setText(self._tr("browse_button"))
         self.danmaku_browse_button.setText(self._tr("browse_button"))
-        self.monitor_tree.setHeaderLabels(
-            [
-                self._tr("monitor_headers_enabled"),
-                self._tr("monitor_headers_url"),
-                self._tr("monitor_headers_status"),
-                self._tr("monitor_headers_last_live"),
-                self._tr("monitor_headers_last_capture"),
-            ]
-        )
+        if hasattr(self, "monitor_tree"):
+            self.monitor_tree.setHeaderLabels(
+                [
+                    self._tr("monitor_headers_enabled"),
+                    self._tr("monitor_headers_url"),
+                    self._tr("monitor_headers_status"),
+                    self._tr("monitor_headers_last_live"),
+                    self._tr("monitor_headers_last_capture"),
+                ]
+            )
         self.outputs_tree.setHeaderLabels([self._tr("outputs_header_artifact"), self._tr("outputs_header_value")])
-        for column in range(self.monitor_tree.columnCount()):
-            self.monitor_tree.resizeColumnToContents(column)
+        if hasattr(self, "monitor_tree"):
+            for column in range(self.monitor_tree.columnCount()):
+                self.monitor_tree.resizeColumnToContents(column)
         self.outputs_tree.resizeColumnToContents(0)
         self.summary_text.setPlaceholderText(self._tr("summary_placeholder"))
         self._set_asr_runtime_info(
@@ -385,9 +592,9 @@ class MainWindow(QMainWindow):
 
         top_row = QHBoxLayout()
         title_box = QVBoxLayout()
-        self.header_title = QLabel(self._tr("app_title"))
+        self.header_title = QLabel(self._window_title_text())
         self.header_title.setProperty("role", "title")
-        self.header_subtitle = QLabel(self._tr("app_subtitle"))
+        self.header_subtitle = QLabel(self._window_subtitle_text())
         self.header_subtitle.setProperty("role", "muted")
         title_box.addWidget(self.header_title)
         title_box.addWidget(self.header_subtitle)
@@ -457,7 +664,10 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(14)
         layout.addWidget(self._build_capture_group())
-        layout.addWidget(self._build_monitor_group(), 1)
+        if self._supports_capture_mode():
+            layout.addWidget(self._build_monitor_group(), 1)
+        else:
+            layout.addStretch(1)
         return panel
 
     def _build_right_panel(self) -> QWidget:
@@ -494,10 +704,20 @@ class MainWindow(QMainWindow):
         form.addRow(self.danmaku_label, self._wrap_picker_row(self.danmaku_input, self.danmaku_browse_button))
         layout.addLayout(form)
 
+        if not self._supports_analysis_mode():
+            for field in (self.replay_input, self.occupancy_input, self.danmaku_input):
+                field.setReadOnly(True)
+            self.replay_browse_button.hide()
+            self.occupancy_browse_button.hide()
+            self.danmaku_browse_button.hide()
+
         self.capture_hint = QLabel(self._tr("capture_hint"))
         self.capture_hint.setProperty("role", "muted")
         self.capture_hint.setWordWrap(True)
         layout.addWidget(self.capture_hint)
+
+        if self._supports_analysis_mode():
+            layout.addWidget(self._build_analysis_provider_group())
 
         actions = QGridLayout()
         actions.setHorizontalSpacing(10)
@@ -510,9 +730,17 @@ class MainWindow(QMainWindow):
         self.stop_capture_button.setEnabled(False)
         self.run_button = QPushButton(self._tr("run_analysis_button"))
         self.run_button.clicked.connect(self._run_analysis)
-        actions.addWidget(self.capture_button, 0, 0)
-        actions.addWidget(self.stop_capture_button, 0, 1)
-        actions.addWidget(self.run_button, 1, 0, 1, 2)
+        if self._supports_capture_mode():
+            actions.addWidget(self.capture_button, 0, 0)
+            actions.addWidget(self.stop_capture_button, 0, 1)
+        else:
+            self.capture_button.hide()
+            self.stop_capture_button.hide()
+        if self._supports_analysis_mode():
+            analysis_row = 1 if self._supports_capture_mode() else 0
+            actions.addWidget(self.run_button, analysis_row, 0, 1, 2)
+        else:
+            self.run_button.hide()
         layout.addLayout(actions)
         return group
 
@@ -568,7 +796,69 @@ class MainWindow(QMainWindow):
         footer.addWidget(self.save_monitor_button)
         footer.addWidget(self.stop_monitor_button)
         layout.addLayout(footer)
+        layout.addWidget(self._build_notification_group())
         return group
+
+    def _build_analysis_provider_group(self) -> QWidget:
+        box = self._build_card()
+        layout = QFormLayout(box)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+        self.analysis_provider_label = QLabel()
+        self.analysis_provider_combo = QComboBox()
+        self.analysis_provider_combo.addItem("", OPENAI_COMPATIBLE_PROVIDER)
+        self.analysis_provider_combo.addItem("", DEEPSEEK_PROVIDER)
+        self.analysis_provider_combo.currentIndexChanged.connect(self._on_analysis_provider_changed)
+        self.analysis_base_url_label = QLabel()
+        self.analysis_base_url_input = QLineEdit()
+        self.analysis_api_key_label = QLabel()
+        self.analysis_api_key_input = QLineEdit()
+        self.analysis_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.analysis_model_label = QLabel()
+        self.analysis_model_input = QLineEdit()
+        layout.addRow(self.analysis_provider_label, self.analysis_provider_combo)
+        layout.addRow(self.analysis_base_url_label, self.analysis_base_url_input)
+        layout.addRow(self.analysis_api_key_label, self.analysis_api_key_input)
+        layout.addRow(self.analysis_model_label, self.analysis_model_input)
+        self._refresh_analysis_provider_labels()
+        self._load_analysis_provider_settings()
+        return box
+
+    def _build_notification_group(self) -> QWidget:
+        box = self._build_card()
+        layout = QFormLayout(box)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+        self.notification_provider_label = QLabel()
+        self.notification_provider_combo = QComboBox()
+        self.notification_provider_combo.addItem("", "none")
+        self.notification_provider_combo.addItem("", "feishu")
+        self.notification_provider_combo.addItem("", "dingtalk")
+        self.notification_webhook_label = QLabel()
+        self.notification_webhook_input = QLineEdit()
+        self.memory_threshold_label = QLabel()
+        self.memory_threshold_spin = QSpinBox()
+        self.memory_threshold_spin.setRange(256, 131072)
+        self.memory_threshold_spin.setSingleStep(256)
+        self.notification_cooldown_label = QLabel()
+        self.notification_cooldown_spin = QSpinBox()
+        self.notification_cooldown_spin.setRange(1, 1440)
+        self.notification_cooldown_spin.setSingleStep(5)
+        self.notification_save_button = QPushButton()
+        self.notification_save_button.setProperty("variant", "ghost")
+        self.notification_save_button.clicked.connect(self._on_save_notification_settings)
+        layout.addRow(self.notification_provider_label, self.notification_provider_combo)
+        layout.addRow(self.notification_webhook_label, self.notification_webhook_input)
+        layout.addRow(self.memory_threshold_label, self.memory_threshold_spin)
+        layout.addRow(self.notification_cooldown_label, self.notification_cooldown_spin)
+        layout.addRow(QWidget(), self.notification_save_button)
+        config = self._load_notification_config()
+        self.notification_provider_combo.setCurrentIndex(max(self.notification_provider_combo.findData(config.provider), 0))
+        self.notification_webhook_input.setText(config.webhook_url)
+        self.memory_threshold_spin.setValue(config.memory_threshold_mb)
+        self.notification_cooldown_spin.setValue(config.cooldown_minutes)
+        self._refresh_notification_labels()
+        return box
 
     def _build_workflow_group(self) -> QWidget:
         group = QGroupBox(self._tr("workflow_group"))
@@ -795,6 +1085,8 @@ class MainWindow(QMainWindow):
         self.monitor_tree.blockSignals(False)
 
     def _load_monitor_profiles(self) -> None:
+        if not hasattr(self, "monitor_tree"):
+            return
         profiles = self.monitor_profiles.list_profiles()
         if profiles:
             self._replace_monitor_tree(profiles)
@@ -806,9 +1098,75 @@ class MainWindow(QMainWindow):
         self._set_notice(self._tr("saved_monitor_profiles", count=len(profiles)), WorkflowStatus.SUCCESS)
         self._append_log(self._tr("saved_monitor_profiles_log", count=len(profiles)))
 
+    def _on_save_notification_settings(self) -> None:
+        config = self._save_notification_config()
+        self._append_log(
+            self._lang_text(
+                f"已保存机器人告警配置: {self._notification_provider_display(config.provider)}",
+                f"Saved alert settings: {self._notification_provider_display(config.provider)}",
+            )
+        )
+        self._set_notice(
+            self._lang_text("告警配置已保存。", "Alert settings saved."),
+            WorkflowStatus.SUCCESS,
+        )
+
+    def _check_memory_pressure(self) -> None:
+        if not self._supports_capture_mode():
+            return
+        if not (self.monitor_worker and self.monitor_worker.isRunning()):
+            return
+        config = self._load_notification_config()
+        if not config.enabled():
+            return
+        should_alert, available_mb = self.memory_watcher.should_alert(config)
+        if not should_alert or available_mb is None:
+            return
+        message = self._lang_text(
+            f"可用内存降到 {available_mb} MB，已低于阈值 {config.memory_threshold_mb} MB。",
+            f"Available memory dropped to {available_mb} MB, below the threshold of {config.memory_threshold_mb} MB.",
+        )
+        self._append_log(f"[health] {message}")
+        self._set_notice(message, WorkflowStatus.WARNING)
+        self._send_robot_notification(
+            self._lang_text("采集端低内存告警", "Capture Client Low Memory Alert"),
+            message,
+        )
+
+    def _send_robot_notification(self, title: str, body: str) -> None:
+        config = self._load_notification_config()
+        if not config.enabled():
+            return
+        try:
+            self.robot_notifier.send_text(config, title, body)
+            self._append_log(
+                self._lang_text(
+                    f"机器人告警已发送: {title}",
+                    f"Robot alert sent: {title}",
+                )
+            )
+        except Exception as exc:
+            self._append_log(
+                self._lang_text(
+                    f"机器人告警发送失败: {exc}",
+                    f"Robot alert failed: {exc}",
+                )
+            )
+
     def _maybe_prompt_start_saved_monitor(self) -> None:
+        if not self._supports_capture_mode():
+            return
         enabled_count = len([profile for profile in self.monitor_profiles.enabled_profiles() if profile.profile_url.strip()])
         if enabled_count == 0:
+            return
+        if self.auto_start_monitor:
+            self._append_log(
+                self._lang_text(
+                    f"检测到 {enabled_count} 个已启用监控，已自动启动。",
+                    f"Detected {enabled_count} enabled monitor profiles and started automatically.",
+                )
+            )
+            self._start_monitor()
             return
         answer = QMessageBox.question(
             self,
@@ -856,12 +1214,19 @@ class MainWindow(QMainWindow):
             self.monitor_profiles.set_enabled(profile_url, item.checkState(0) == Qt.CheckState.Checked)
 
     def _run_analysis(self) -> None:
+        self._save_analysis_provider_settings()
         try:
             request = self.workflow.build_analysis_request(
                 replay_path=self.replay_input.text(),
                 occupancy_path=self.occupancy_input.text(),
                 danmaku_path=self.danmaku_input.text(),
                 room_id=self.room_input.text(),
+                analysis_provider=str(self.analysis_provider_combo.currentData() or OPENAI_COMPATIBLE_PROVIDER)
+                if hasattr(self, "analysis_provider_combo")
+                else OPENAI_COMPATIBLE_PROVIDER,
+                analysis_base_url=self.analysis_base_url_input.text() if hasattr(self, "analysis_base_url_input") else "",
+                analysis_api_key=self.analysis_api_key_input.text() if hasattr(self, "analysis_api_key_input") else "",
+                analysis_model_id=self.analysis_model_input.text() if hasattr(self, "analysis_model_input") else "",
             )
         except ValueError as exc:
             self._set_notice(str(exc), WorkflowStatus.WARNING)
@@ -926,6 +1291,7 @@ class MainWindow(QMainWindow):
 
     def _start_monitor(self) -> None:
         self._save_monitor_profiles()
+        self._save_notification_config()
         enabled_profiles = self.monitor_profiles.enabled_profiles()
         if not enabled_profiles:
             self._set_notice(self._tr("enable_profile_first"), WorkflowStatus.WARNING)
@@ -1015,7 +1381,8 @@ class MainWindow(QMainWindow):
                 summary_lines=[self._tr("analysis_failed_short"), message],
             )
         )
-        QMessageBox.critical(self, self._tr("analysis_failed_title"), message)
+        if self.app_mode != "capture":
+            QMessageBox.critical(self, self._tr("analysis_failed_title"), message)
 
     def _on_capture_finished(self, payload: dict) -> None:
         replay_path = payload.get("replay_path") or ""
@@ -1056,6 +1423,14 @@ class MainWindow(QMainWindow):
                 summary_lines=summary_lines,
             )
         )
+        if not stopped:
+            self._send_robot_notification(
+                self._lang_text("录播采集完成", "Replay Capture Completed"),
+                self._lang_text(
+                    f"房间 {payload.get('room_id') or '-'} 采集完成。\n工作目录: {workspace_dir or '-'}",
+                    f"Capture for room {payload.get('room_id') or '-'} completed.\nWorkspace: {workspace_dir or '-'}",
+                ),
+            )
 
     def _on_capture_failed(self, message: str) -> None:
         self._append_log(self._tr("capture_failed_log", message=message))
@@ -1070,7 +1445,12 @@ class MainWindow(QMainWindow):
                 summary_lines=[self._tr("capture_failed_short"), message],
             )
         )
-        QMessageBox.critical(self, self._tr("capture_failed_title"), message)
+        self._send_robot_notification(
+            self._lang_text("录播采集失败", "Replay Capture Failed"),
+            message,
+        )
+        if self.app_mode != "capture":
+            QMessageBox.critical(self, self._tr("capture_failed_title"), message)
 
     def _on_monitor_event(self, payload: dict) -> None:
         message = str(payload.get("message", "")).strip()
@@ -1131,7 +1511,12 @@ class MainWindow(QMainWindow):
                 summary_lines=[self._tr("monitor_failed_short"), message],
             )
         )
-        QMessageBox.critical(self, self._tr("monitor_failed_title"), message)
+        self._send_robot_notification(
+            self._lang_text("监控循环异常", "Monitor Loop Error"),
+            message,
+        )
+        if self.app_mode != "capture":
+            QMessageBox.critical(self, self._tr("monitor_failed_title"), message)
 
     def _on_monitor_finished(self) -> None:
         self._append_log(self._tr("monitor_stopped_log"))
@@ -1150,16 +1535,21 @@ class MainWindow(QMainWindow):
         capture_running = bool(self.capture_worker and self.capture_worker.isRunning())
         analysis_running = bool(self.worker and self.worker.isRunning())
         monitor_running = bool(self.monitor_worker and self.monitor_worker.isRunning())
-        self.capture_button.setEnabled(not capture_running and not analysis_running)
-        self.stop_capture_button.setEnabled(capture_running)
-        self.run_button.setEnabled(not analysis_running and not capture_running)
-        self.monitor_button.setEnabled(not monitor_running and not capture_running)
-        self.stop_monitor_button.setEnabled(monitor_running)
+        if hasattr(self, "capture_button"):
+            self.capture_button.setEnabled(not capture_running and not analysis_running)
+        if hasattr(self, "stop_capture_button"):
+            self.stop_capture_button.setEnabled(capture_running)
+        if hasattr(self, "run_button"):
+            self.run_button.setEnabled(not analysis_running and not capture_running)
+        if hasattr(self, "monitor_button"):
+            self.monitor_button.setEnabled(not monitor_running and not capture_running)
+        if hasattr(self, "stop_monitor_button"):
+            self.stop_monitor_button.setEnabled(monitor_running)
 
 
-def main() -> int:
+def main(app_mode: str = "all", *, auto_start_monitor: bool | None = None) -> int:
     app = QApplication(sys.argv)
-    window = MainWindow()
+    window = MainWindow(app_mode=app_mode, auto_start_monitor=auto_start_monitor)
     window.show()
     return app.exec()
 

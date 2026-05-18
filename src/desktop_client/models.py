@@ -49,6 +49,10 @@ class DesktopAnalysisRequest:
     workspace_dir: Path
     danmaku_path: Path | None = None
     room_id: str | None = None
+    analysis_provider: str | None = None
+    analysis_base_url: str | None = None
+    analysis_api_key: str | None = None
+    analysis_model_id: str | None = None
 
 
 @dataclass(slots=True)

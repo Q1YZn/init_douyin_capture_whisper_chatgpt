@@ -135,6 +135,10 @@ class DesktopWorkflowService:
         occupancy_path: str,
         danmaku_path: str,
         room_id: str,
+        analysis_provider: str | None = None,
+        analysis_base_url: str | None = None,
+        analysis_api_key: str | None = None,
+        analysis_model_id: str | None = None,
     ) -> DesktopAnalysisRequest:
         replay_text = replay_path.strip()
         occupancy_text = occupancy_path.strip()
@@ -155,6 +159,10 @@ class DesktopWorkflowService:
             danmaku_path=danmaku,
             room_id=room,
             workspace_dir=self.settings.workspace_root / "jobs",
+            analysis_provider=analysis_provider.strip() if analysis_provider else None,
+            analysis_base_url=analysis_base_url.strip() if analysis_base_url else None,
+            analysis_api_key=analysis_api_key.strip() if analysis_api_key else None,
+            analysis_model_id=analysis_model_id.strip() if analysis_model_id else None,
         )
 
     def run_analysis(self, request: DesktopAnalysisRequest) -> DesktopAnalysisResult:

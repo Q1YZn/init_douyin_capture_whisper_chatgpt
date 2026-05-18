@@ -22,7 +22,9 @@
 - `src/post_live_analyst`：回放分析核心
 - `src/desktop_client`：Windows 桌面客户端
 - `src/cloud_api`：云端 API 与异步任务
-- `scripts/launch_desktop.py`：启动桌面端
+- `scripts/launch_desktop.py`：启动综合桌面端
+- `scripts/launch_capture_desktop.py`：启动采集监控端
+- `scripts/launch_analyzer_desktop.py`：启动视频分析端
 - `scripts/start_api.py`：启动 FastAPI
 - `scripts/start_worker.py`：启动 RQ Worker
 - `scripts/download_whisper_model.py`：预下载 faster-whisper 模型
@@ -180,6 +182,8 @@ $env:SERVER_BASE_URL="http://127.0.0.1:8000"
 $env:OPENAI_BASE_URL="http://127.0.0.1:8317/v1"
 $env:OPENAI_API_KEY="your-api-key-1"
 $env:OPENAI_CHAT_MODEL_ID="gpt-5.4"
+$env:DEEPSEEK_API_KEY="..."
+$env:DEEPSEEK_MODEL_ID="deepseek-v4-pro"
 $env:DOUYIN_COOKIE="..."
 $env:DOUYIN_USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 $env:DSO_ASR_MODEL="D:\privacy\ai_coder\DouyinStreamOps\models\faster-whisper-small"
@@ -196,6 +200,10 @@ $env:PYANNOTE_AUTH_TOKEN="..."
   - 模型代理鉴权
 - `OPENAI_CHAT_MODEL_ID`
   - 热点分析使用的模型名
+- `DEEPSEEK_API_KEY`
+  - 分析端直连 DeepSeek 时使用的 API Key
+- `DEEPSEEK_MODEL_ID`
+  - 分析端直连 DeepSeek 时使用的模型名，默认可用 `deepseek-v4-pro`
 - `DOUYIN_COOKIE`
   - 直播采集建议必配，否则采集可能失败或不稳定
 - `DSO_ASR_MODEL`
@@ -225,7 +233,44 @@ pip install -r requirements-desktop.txt
 python scripts/launch_desktop.py
 ```
 
-### 8.2 运行完整联调环境
+### 8.2 启动采集监控端
+
+适用于：
+
+- 无人值守监控直播间
+- 自动落地录播、人数和弹幕文件
+- 内存不足时通过飞书 / 钉钉机器人发告警
+
+```powershell
+pip install -r requirements-desktop.txt
+python scripts/launch_capture_desktop.py
+```
+
+说明：
+
+- 采集端会自动读取已保存的监控列表
+- 如果存在已启用的主页，启动后会自动进入监控
+- 机器人告警配置在采集端界面内保存
+
+### 8.3 启动视频分析端
+
+适用于：
+
+- 导入采集得到的回放和结构化文件
+- 透传到 OpenAI-compatible 模型或 DeepSeek 做热点分析
+- 上传结构化结果到云端
+
+```powershell
+pip install -r requirements-desktop.txt
+python scripts/launch_analyzer_desktop.py
+```
+
+说明：
+
+- 分析端内置 `OpenAI 兼容代理` 和 `DeepSeek 直连` 两种模型配置
+- 切到 `DeepSeek 直连` 后，默认接口地址为 `https://api.deepseek.com`
+
+### 8.4 运行完整联调环境
 
 适用于：
 
@@ -250,7 +295,7 @@ python scripts/start_worker.py
 
 ```powershell
 pip install -r requirements-desktop.txt
-python scripts/launch_desktop.py
+python scripts/launch_analyzer_desktop.py
 ```
 
 ## 9. 推荐的首次启动顺序

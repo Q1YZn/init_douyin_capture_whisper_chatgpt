@@ -63,17 +63,25 @@ class DesktopAnalysisService:
         model_reference = self._resolve_whisper_model_reference()
         transcriber = FasterWhisperTranscriber(model_size=model_reference)
         uploader = CloudUploader(self.settings.server_base_url)
+        analyst_base_url = (request.analysis_base_url or self.settings.cli_proxy_base_url).strip()
+        analyst_api_key = (request.analysis_api_key or self.settings.cli_proxy_api_key).strip()
+        analyst_model_id = (request.analysis_model_id or self.settings.cli_proxy_model_id).strip()
         analyst = CliProxyAgentAnalyst(
             CliProxyConfig(
-                base_url=self.settings.cli_proxy_base_url,
-                api_key=self.settings.cli_proxy_api_key,
-                model_id=self.settings.cli_proxy_model_id,
+                base_url=analyst_base_url,
+                api_key=analyst_api_key,
+                model_id=analyst_model_id,
             )
         )
 
         transcript_path: Path | None = None
         transcript_segments: list[dict[str, Any]] = []
-        diagnostics: list[str] = [f"ASR model reference: {model_reference}"]
+        diagnostics: list[str] = [
+            f"ASR model reference: {model_reference}",
+            f"Analysis provider: {(request.analysis_provider or 'openai_compatible')}",
+            f"Analysis base URL: {analyst_base_url}",
+            f"Analysis model: {analyst_model_id}",
+        ]
         if video_size_bytes is not None:
             diagnostics.append(f"Replay size: {self._format_size(video_size_bytes)}")
         if offload_required:
