@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import fields
 from datetime import datetime
 from typing import Any, Callable
@@ -66,18 +67,21 @@ def generate_report(job_id: str) -> None:
             session.add(analysis_job)
             session.commit()
 
-            def _record_deepseek_progress(index: int, total: int, anchor_payload: dict[str, Any]) -> None:
+            concurrency = settings.deepseek_anchor_concurrency
+
+            def _record_deepseek_progress(completed: int, total: int, anchor_payload: dict[str, Any]) -> None:
                 selection_state = timeline.setdefault("analysis_selection", {})
                 if isinstance(selection_state, dict):
                     selection_state["status"] = "deepseek_running"
-                    selection_state["current_anchor_index"] = index
+                    selection_state["completed_anchor_count"] = completed
                     selection_state["current_anchor_total"] = total
-                    selection_state["current_anchor_id"] = anchor_payload.get("anchor_id")
-                    selection_state["current_anchor_timestamp"] = anchor_payload.get("timestamp")
+                    selection_state["last_completed_anchor_id"] = anchor_payload.get("anchor_id")
+                    selection_state["last_completed_anchor_timestamp"] = anchor_payload.get("timestamp")
+                    selection_state["concurrency"] = concurrency
                 analysis_job.status = "running"
                 analysis_job.message = (
                     "DeepSeek analysis running: "
-                    f"{index}/{total} selected anchors"
+                    f"{completed}/{total} selected anchors, concurrency={concurrency}"
                 )
                 analysis_job.timeline_json = json.dumps(timeline, ensure_ascii=False)
                 session.add(analysis_job)
@@ -248,13 +252,20 @@ def _run_deepseek_anchor_analysis(
 ) -> dict[str, Any]:
     anchors = list(timeline.get("anchors") or [])
     selection = _select_anchors_for_deepseek(timeline, max_anchors=settings.deepseek_max_anchors)
-    selected_ids = set(selection["selected_anchor_ids"])
-    selected_anchors = [anchor for anchor in anchors if anchor.get("anchor_id") in selected_ids]
+    selected_id_order = {
+        anchor_id: index
+        for index, anchor_id in enumerate(selection["selected_anchor_ids"])
+    }
+    selected_anchors = sorted(
+        [anchor for anchor in anchors if anchor.get("anchor_id") in selected_id_order],
+        key=lambda anchor: selected_id_order[anchor.get("anchor_id")],
+    )
     previous_selection = timeline.get("analysis_selection") if isinstance(timeline.get("analysis_selection"), dict) else {}
     timeline["analysis_selection"] = {
         **previous_selection,
         **selection,
         "status": "deepseek_running" if selected_anchors else selection.get("status", "selected"),
+        "concurrency": settings.deepseek_anchor_concurrency,
     }
 
     existing_analyses = timeline.get("agent_analyses") or []
@@ -281,18 +292,57 @@ def _run_deepseek_anchor_analysis(
     timeline["analysis_selection"]["model_id"] = _provider_model_id(settings.deepseek_model_id, settings.deepseek_base_url)
     occupancy_summary = _timeline_occupancy_summary(timeline)
     aligned_segments = [_aligned_segment_from_dict(segment) for segment in timeline.get("aligned_segments", [])]
-    analyses: list[dict[str, Any]] = []
-    for index, anchor_payload in enumerate(selected_anchors, start=1):
-        if progress_callback is not None:
-            progress_callback(index, len(selected_anchors), anchor_payload)
-        anchor = _anchor_from_dict(anchor_payload)
-        related_segments = _related_segments(anchor, aligned_segments)
-        result = analyst.analyze_anchor(anchor, related_segments, occupancy_summary=occupancy_summary)
-        analyses.append(result.to_dict())
+    analyses_by_index: list[dict[str, Any] | None] = [None] * len(selected_anchors)
 
+    def _analyze_anchor(index: int, anchor_payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        anchor_id = str(anchor_payload.get("anchor_id") or f"anchor_{index:04d}")
+        try:
+            anchor = _anchor_from_dict(anchor_payload)
+            related_segments = _related_segments(anchor, aligned_segments)
+            result = analyst.analyze_anchor(anchor, related_segments, occupancy_summary=occupancy_summary)
+            return index, result.to_dict()
+        except Exception as exc:
+            return index, {
+                "anchor_id": anchor_id,
+                "status": "error",
+                "model_id": analyst.config.model_id,
+                "error": str(exc),
+                "anchor": anchor_payload,
+            }
+
+    max_workers = max(1, min(settings.deepseek_anchor_concurrency, len(selected_anchors)))
+    completed_count = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_analyze_anchor, index, anchor_payload): (index, anchor_payload)
+            for index, anchor_payload in enumerate(selected_anchors)
+        }
+        for future in as_completed(futures):
+            index, anchor_payload = futures[future]
+            try:
+                result_index, result = future.result()
+            except Exception as exc:  # pragma: no cover - _analyze_anchor already isolates failures
+                result_index = index
+                result = {
+                    "anchor_id": str(anchor_payload.get("anchor_id") or f"anchor_{index:04d}"),
+                    "status": "error",
+                    "model_id": analyst.config.model_id,
+                    "error": str(exc),
+                    "anchor": anchor_payload,
+                }
+            analyses_by_index[result_index] = result
+            completed_count += 1
+            if progress_callback is not None:
+                progress_callback(completed_count, len(selected_anchors), anchor_payload)
+
+    analyses = [analysis for analysis in analyses_by_index if analysis is not None]
     ok_count = sum(1 for item in analyses if item.get("status") == "ok")
     timeline["agent_analyses"] = analyses
-    timeline["analysis_selection"]["status"] = "completed" if ok_count else "completed_with_model_errors"
+    timeline["analysis_selection"]["status"] = (
+        "completed"
+        if ok_count == len(analyses)
+        else "completed_with_model_errors"
+    )
     timeline["analysis_selection"]["ok_count"] = ok_count
     timeline["analysis_selection"]["error_count"] = len(analyses) - ok_count
     return timeline

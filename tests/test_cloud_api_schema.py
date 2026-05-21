@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -51,6 +53,20 @@ def test_server_settings_exposes_deepseek_timeout(monkeypatch) -> None:
     monkeypatch.setenv("DEEPSEEK_TIMEOUT_SECONDS", "45")
 
     assert ServerSettings.from_env().deepseek_timeout_seconds == 45
+
+
+def test_server_settings_clamps_anchor_concurrency(monkeypatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_ANCHOR_CONCURRENCY", "20")
+    assert ServerSettings.from_env().deepseek_anchor_concurrency == 20
+
+    monkeypatch.setenv("DEEPSEEK_ANCHOR_CONCURRENCY", "bad")
+    assert ServerSettings.from_env().deepseek_anchor_concurrency == 20
+
+    monkeypatch.setenv("DEEPSEEK_ANCHOR_CONCURRENCY", "500")
+    assert ServerSettings.from_env().deepseek_anchor_concurrency == 50
+
+    monkeypatch.setenv("DEEPSEEK_ANCHOR_CONCURRENCY", "0")
+    assert ServerSettings.from_env().deepseek_anchor_concurrency == 1
 
 
 def test_enqueue_report_job_uses_configured_timeout(monkeypatch) -> None:
@@ -168,3 +184,149 @@ def test_generate_report_marks_failed_on_exception(monkeypatch, tmp_path) -> Non
     assert job.message == "Report generation failed"
     assert job.error == "DeepSeek timeout"
     assert json.loads(job.timeline_json)["analysis_selection"]["status"] == "failed"
+
+
+def _anchor_payload(anchor_id: str, timestamp: float) -> dict:
+    return {
+        "anchor_id": anchor_id,
+        "timestamp": timestamp,
+        "window_start": max(0.0, timestamp - 10),
+        "window_end": timestamp + 10,
+        "direction": "surge",
+        "abs_change": 100,
+        "pct_change": 0.1,
+        "baseline_count": 1000,
+        "target_count": 1100,
+        "slope_per_min": 10.0,
+        "reason_hint": "test",
+        "score": 2.0,
+        "priority": "medium",
+    }
+
+
+def _segment_payload(anchor_id: str, start: float) -> dict:
+    return {
+        "segment_id": f"segment-{anchor_id}",
+        "start": start,
+        "end": start + 5,
+        "text": f"text for {anchor_id}",
+        "occupancy": {
+            "window_start": start,
+            "window_end": start + 5,
+            "sample_count": 1,
+            "mean": 1000,
+            "peak": 1100,
+            "minimum": 900,
+            "delta": 100,
+            "pct_change": 0.1,
+            "slope_per_sec": 1.0,
+            "slope_per_min": 60.0,
+        },
+        "nearby_anchor_ids": [anchor_id],
+    }
+
+
+def _timeline_for_anchor_concurrency() -> dict:
+    anchors = [
+        _anchor_payload("anchor_0003", 30.0),
+        _anchor_payload("anchor_0001", 10.0),
+        _anchor_payload("anchor_0002", 20.0),
+        _anchor_payload("anchor_0004", 40.0),
+        _anchor_payload("anchor_0005", 50.0),
+        _anchor_payload("anchor_0006", 60.0),
+    ]
+    return {
+        "anchors": anchors,
+        "aligned_segments": [
+            _segment_payload(anchor["anchor_id"], float(anchor["timestamp"]) - 2)
+            for anchor in anchors
+        ],
+        "occupancy_summary": {"duration_minutes": 30},
+    }
+
+
+def test_deepseek_anchor_analysis_runs_concurrently_and_preserves_time_order(monkeypatch) -> None:
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    class FakeResult:
+        def __init__(self, anchor_id: str) -> None:
+            self.anchor_id = anchor_id
+
+        def to_dict(self) -> dict:
+            return {
+                "anchor_id": self.anchor_id,
+                "status": "ok",
+                "model_id": "fake-model",
+                "response_text": f"analysis {self.anchor_id}",
+            }
+
+    class FakeAnalyst:
+        def __init__(self, config) -> None:
+            self.config = config
+
+        def analyze_anchor(self, anchor, _segments, occupancy_summary=None):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.03 if anchor.anchor_id == "anchor_0001" else 0.01)
+            with lock:
+                active -= 1
+            return FakeResult(anchor.anchor_id)
+
+    monkeypatch.setattr(cloud_tasks.settings, "deepseek_api_key", "key")
+    monkeypatch.setattr(cloud_tasks.settings, "deepseek_anchor_concurrency", 3)
+    monkeypatch.setattr(cloud_tasks.settings, "deepseek_max_anchors", 40)
+    monkeypatch.setattr(cloud_tasks, "CliProxyAgentAnalyst", FakeAnalyst)
+
+    progress: list[tuple[int, int, str]] = []
+    timeline = cloud_tasks._run_deepseek_anchor_analysis(
+        _timeline_for_anchor_concurrency(),
+        progress_callback=lambda done, total, anchor: progress.append((done, total, anchor["anchor_id"])),
+    )
+
+    assert max_active > 1
+    assert [item["anchor_id"] for item in timeline["agent_analyses"]] == [
+        "anchor_0001",
+        "anchor_0002",
+        "anchor_0003",
+        "anchor_0004",
+        "anchor_0005",
+        "anchor_0006",
+    ]
+    assert progress[-1][:2] == (6, 6)
+    assert timeline["analysis_selection"]["status"] == "completed"
+    assert timeline["analysis_selection"]["concurrency"] == 3
+
+
+def test_deepseek_anchor_analysis_keeps_report_when_one_anchor_fails(monkeypatch) -> None:
+    class FakeAnalyst:
+        def __init__(self, config) -> None:
+            self.config = config
+
+        def analyze_anchor(self, anchor, _segments, occupancy_summary=None):
+            if anchor.anchor_id == "anchor_0002":
+                raise RuntimeError("rate limited")
+
+            class FakeResult:
+                def to_dict(self_inner) -> dict:
+                    return {"anchor_id": anchor.anchor_id, "status": "ok", "model_id": "fake-model"}
+
+            return FakeResult()
+
+    monkeypatch.setattr(cloud_tasks.settings, "deepseek_api_key", "key")
+    monkeypatch.setattr(cloud_tasks.settings, "deepseek_anchor_concurrency", 20)
+    monkeypatch.setattr(cloud_tasks.settings, "deepseek_max_anchors", 40)
+    monkeypatch.setattr(cloud_tasks, "CliProxyAgentAnalyst", FakeAnalyst)
+
+    timeline = cloud_tasks._run_deepseek_anchor_analysis(_timeline_for_anchor_concurrency())
+    analyses = timeline["agent_analyses"]
+
+    assert timeline["analysis_selection"]["status"] == "completed_with_model_errors"
+    assert timeline["analysis_selection"]["ok_count"] == 5
+    assert timeline["analysis_selection"]["error_count"] == 1
+    failed = [item for item in analyses if item["status"] == "error"]
+    assert failed[0]["anchor_id"] == "anchor_0002"
+    assert failed[0]["error"] == "rate limited"
