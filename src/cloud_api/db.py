@@ -33,6 +33,7 @@ def ensure_analysis_job_columns() -> None:
         "asset_uri": "VARCHAR(2048)",
         "analysis_tier": "VARCHAR(64)",
         "payment_required": _dialect_type("BOOLEAN", "INTEGER"),
+        "rq_job_id": "VARCHAR(128)",
         "message": "TEXT",
         "error": "TEXT",
     }

@@ -198,6 +198,8 @@ class DesktopWorkflowService:
         analysis_base_url: str | None = None,
         analysis_api_key: str | None = None,
         analysis_model_id: str | None = None,
+        server_base_url: str | None = None,
+        server_auth_token: str | None = None,
     ) -> DesktopAnalysisRequest:
         replay_text = replay_path.strip()
         occupancy_text = occupancy_path.strip()
@@ -212,20 +214,38 @@ class DesktopWorkflowService:
         if danmaku is not None and not danmaku.is_file():
             raise ValueError("Danmaku JSONL/CSV must point to an existing file.")
 
+        analysis_root = replay.parent / "analysis" if replay.parent.exists() else self.settings.workspace_root / "analysis"
         return DesktopAnalysisRequest(
             replay_path=replay,
             occupancy_path=occupancy,
             danmaku_path=danmaku,
             room_id=room,
-            workspace_dir=self.settings.workspace_root / "jobs",
+            workspace_dir=analysis_root,
             analysis_provider=analysis_provider.strip() if analysis_provider else None,
             analysis_base_url=analysis_base_url.strip() if analysis_base_url else None,
             analysis_api_key=analysis_api_key.strip() if analysis_api_key else None,
             analysis_model_id=analysis_model_id.strip() if analysis_model_id else None,
+            server_base_url=server_base_url.strip() if server_base_url else None,
+            server_auth_token=server_auth_token.strip() if server_auth_token else None,
         )
 
-    def run_analysis(self, request: DesktopAnalysisRequest) -> DesktopAnalysisResult:
-        return self.analysis_service.run(request)
+    def run_analysis(self, request: DesktopAnalysisRequest, progress_callback=None) -> DesktopAnalysisResult:
+        return self.analysis_service.run(request, progress_callback=progress_callback)
+
+    def resubmit_existing_analysis(
+        self,
+        workspace_dir: Path,
+        *,
+        server_base_url: str | None = None,
+        server_auth_token: str | None = None,
+        progress_callback=None,
+    ) -> DesktopAnalysisResult:
+        return self.analysis_service.resubmit_existing_analysis(
+            workspace_dir,
+            server_base_url=server_base_url,
+            server_auth_token=server_auth_token,
+            progress_callback=progress_callback,
+        )
 
     def build_capture_request(self, room_id_or_url: str) -> LiveCaptureRequest:
         cleaned = room_id_or_url.strip()

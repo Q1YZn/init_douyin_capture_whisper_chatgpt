@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:  # pragma: no cover - compatibility for Python 3.10
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
 from pathlib import Path
 
 
@@ -58,6 +64,8 @@ class DesktopAnalysisRequest:
     analysis_base_url: str | None = None
     analysis_api_key: str | None = None
     analysis_model_id: str | None = None
+    server_base_url: str | None = None
+    server_auth_token: str | None = None
 
 
 @dataclass(slots=True)
@@ -69,6 +77,9 @@ class DesktopAnalysisResult:
     summary_path: Path
     uploaded: bool
     report_url: str | None = None
+    remote_job_id: str | None = None
+    cloud_status: str | None = None
+    cloud_report_path: Path | None = None
     asr_model_reference: str | None = None
     asr_device: str | None = None
     asr_compute_type: str | None = None

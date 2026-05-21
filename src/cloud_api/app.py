@@ -11,7 +11,7 @@ from .config import ServerSettings
 from .db import Base, engine, ensure_analysis_job_columns, get_session
 from .models import AnalysisJob
 from .schemas import AnalysisJobCreate, AnalysisJobResponse, ClipCandidatesRequest, ClipCandidatesResponse
-from .tasks import enqueue_report_job, generate_clip_candidates, generate_report
+from .tasks import cancel_enqueued_report_job, enqueue_report_job, generate_clip_candidates, generate_report
 
 
 settings = ServerSettings.from_env()
@@ -49,8 +49,15 @@ def create_analysis_job(payload: AnalysisJobCreate) -> AnalysisJobResponse:
     error: str | None = None
     updated_at = None
     report_path: str | None = None
+    rq_job_id: str | None = None
     try:
-        enqueue_report_job(job_id)
+        rq_job_id = enqueue_report_job(job_id)
+        with get_session() as session:
+            job = session.get(AnalysisJob, job_id)
+            if job:
+                job.rq_job_id = rq_job_id
+                session.add(job)
+                session.commit()
     except Exception:
         try:
             generate_report(job_id)
@@ -82,6 +89,7 @@ def create_analysis_job(payload: AnalysisJobCreate) -> AnalysisJobResponse:
         error=error,
         updated_at=updated_at,
         report_url=f"{settings.public_base_url}/api/v1/analysis-jobs/{job_id}/report" if status == "completed" or report_path else None,
+        rq_job_id=rq_job_id,
     )
 
 
@@ -103,6 +111,53 @@ def get_analysis_job(job_id: str) -> AnalysisJobResponse:
             message=job.message,
             error=job.error,
             updated_at=job.updated_at,
+            rq_job_id=job.rq_job_id,
+        )
+
+
+@app.post("/api/v1/analysis-jobs/{job_id}/cancel", response_model=AnalysisJobResponse)
+def cancel_analysis_job(job_id: str) -> AnalysisJobResponse:
+    with get_session() as session:
+        job = session.get(AnalysisJob, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        if job.status in {"completed", "failed", "cancelled"}:
+            report_url = (
+                f"{settings.public_base_url}/api/v1/analysis-jobs/{job_id}/report"
+                if job.report_path
+                else None
+            )
+            return AnalysisJobResponse(
+                job_id=job.job_id,
+                status=job.status,
+                report_url=report_url,
+                message=job.message,
+                error=job.error,
+                updated_at=job.updated_at,
+                rq_job_id=job.rq_job_id,
+            )
+        removed = cancel_enqueued_report_job(job.rq_job_id) if job.status in {"queued", "pending_worker"} else False
+        job.status = "cancelled"
+        job.message = "Cloud analysis cancelled"
+        job.error = None
+        try:
+            timeline = json.loads(job.timeline_json)
+            selection = timeline.setdefault("analysis_selection", {})
+            if isinstance(selection, dict):
+                selection["status"] = "cancelled"
+            job.timeline_json = json.dumps(timeline, ensure_ascii=False)
+        except Exception:
+            pass
+        session.add(job)
+        session.commit()
+        return AnalysisJobResponse(
+            job_id=job.job_id,
+            status=job.status,
+            report_url=None,
+            message=job.message,
+            error=job.error,
+            updated_at=job.updated_at,
+            rq_job_id=job.rq_job_id,
         )
 
 

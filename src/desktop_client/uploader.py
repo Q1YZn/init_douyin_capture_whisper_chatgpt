@@ -75,6 +75,15 @@ class CloudUploader:
         response.raise_for_status()
         return response.json()
 
+    def cancel_analysis_job(self, job_id: str) -> dict[str, Any]:
+        response = requests.post(
+            f"{self.server_base_url}/api/v1/analysis-jobs/{job_id}/cancel",
+            headers=self._headers(),
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def wait_for_analysis_report(
         self,
         job_id: str,
@@ -96,7 +105,8 @@ class CloudUploader:
                     "response": latest,
                 },
             )
-            if latest.get("report_url") or str(latest.get("status") or "").lower() == "completed":
+            status = str(latest.get("status") or "").lower()
+            if latest.get("report_url") or status in {"completed", "failed", "cancelled"}:
                 return latest
             time.sleep(max(0.5, interval_seconds))
         return latest

@@ -34,11 +34,57 @@ redis_conn = Redis.from_url(settings.redis_url) if Redis is not None else None
 queue = Queue("reports", connection=redis_conn) if Queue is not None and redis_conn is not None else None
 
 
+class ReportCancelled(RuntimeError):
+    pass
+
+
 def enqueue_report_job(job_id: str) -> str:
     if queue is None:
         raise RuntimeError("Redis/RQ worker dependencies are not installed.")
     job = queue.enqueue(generate_report, job_id, job_timeout=settings.report_job_timeout_seconds)
     return job.id
+
+
+def cancel_enqueued_report_job(rq_job_id: str | None) -> bool:
+    if queue is None or not rq_job_id:
+        return False
+    try:
+        rq_job = queue.fetch_job(rq_job_id)
+    except Exception:
+        return False
+    if rq_job is None:
+        return False
+    cancelled = False
+    for method_name in ("cancel", "delete"):
+        method = getattr(rq_job, method_name, None)
+        if method is None:
+            continue
+        try:
+            method()
+            cancelled = True
+        except Exception:
+            continue
+    return cancelled
+
+
+def _raise_if_cancelled(session: Any, analysis_job: AnalysisJob, timeline: dict[str, Any] | None = None) -> None:
+    try:
+        session.refresh(analysis_job)
+    except Exception:
+        pass
+    if analysis_job.status != "cancelled":
+        return
+    if timeline is not None:
+        selection = timeline.setdefault("analysis_selection", {})
+        if isinstance(selection, dict):
+            selection["status"] = "cancelled"
+        global_state = timeline.setdefault("global_analysis", {})
+        if isinstance(global_state, dict) and global_state.get("status") == "running":
+            global_state["status"] = "cancelled"
+        analysis_job.timeline_json = json.dumps(timeline, ensure_ascii=False)
+        session.add(analysis_job)
+        session.commit()
+    raise ReportCancelled("Report generation cancelled")
 
 
 def generate_report(job_id: str) -> None:
@@ -49,6 +95,8 @@ def generate_report(job_id: str) -> None:
         with get_session() as session:
             analysis_job = session.get(AnalysisJob, job_id)
             if analysis_job is None:
+                return
+            if analysis_job.status == "cancelled":
                 return
             timeline = json.loads(analysis_job.timeline_json)
             timeline["global_analysis"] = {
@@ -63,6 +111,7 @@ def generate_report(job_id: str) -> None:
             session.commit()
 
             timeline = _run_global_timeline_analysis(timeline)
+            _raise_if_cancelled(session, analysis_job, timeline)
             selection = _select_anchors_for_deepseek(timeline, max_anchors=settings.deepseek_max_anchors)
             timeline["analysis_selection"] = {
                 **selection,
@@ -78,10 +127,12 @@ def generate_report(job_id: str) -> None:
             analysis_job.timeline_json = json.dumps(timeline, ensure_ascii=False)
             session.add(analysis_job)
             session.commit()
+            _raise_if_cancelled(session, analysis_job, timeline)
 
             concurrency = settings.deepseek_anchor_concurrency
 
             def _record_deepseek_progress(completed: int, total: int, anchor_payload: dict[str, Any]) -> None:
+                _raise_if_cancelled(session, analysis_job, timeline)
                 selection_state = timeline.setdefault("analysis_selection", {})
                 if isinstance(selection_state, dict):
                     selection_state["status"] = "deepseek_running"
@@ -100,9 +151,11 @@ def generate_report(job_id: str) -> None:
                 session.commit()
 
             timeline = _run_deepseek_anchor_analysis(timeline, progress_callback=_record_deepseek_progress)
+            _raise_if_cancelled(session, analysis_job, timeline)
             markdown_text = report_builder.build_markdown(timeline, analysis_job.summary_markdown)
             html_text = report_builder.markdown_to_html(markdown_text)
             _, html_path, _ = report_builder.persist_report(job_id, markdown_text, html_text, timeline)
+            _raise_if_cancelled(session, analysis_job, timeline)
             analysis_job.status = "completed"
             analysis_job.message = "Report completed"
             analysis_job.error = None
@@ -112,6 +165,8 @@ def generate_report(job_id: str) -> None:
             analysis_job.report_path = str(html_path)
             session.add(analysis_job)
             session.commit()
+    except ReportCancelled:
+        return
     except Exception as exc:
         with get_session() as session:
             analysis_job = session.get(AnalysisJob, job_id)

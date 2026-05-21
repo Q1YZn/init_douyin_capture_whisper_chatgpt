@@ -421,6 +421,88 @@ def test_cloud_uploader_debug_files_exclude_authorization_token(tmp_path, monkey
     assert "remote-1" in poll_text
 
 
+def _write_reusable_analysis_workspace(workspace_dir: Path) -> None:
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    (workspace_dir / "summary.md").write_text("# Summary", encoding="utf-8")
+    (workspace_dir / "transcript.json").write_text(
+        json.dumps([{"start": 0, "end": 2, "text": "hello"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (workspace_dir / "detailed_timeline.json").write_text(
+        json.dumps(
+            {
+                "job_id": workspace_dir.name,
+                "aligned_segments": [{"start": 0, "end": 2, "text": "hello"}],
+                "transcript_chapters": [{"chapter_id": "chapter_0000", "start": 0, "end": 120}],
+                "occupancy_timeline_blocks": [{"block_id": "occ_0000", "start": 0, "end": 120}],
+                "source_assets": {
+                    "replay_path": str(workspace_dir.parent / "replay.flv"),
+                    "occupancy_path": str(workspace_dir.parent / "occupants.csv"),
+                    "danmaku_path": None,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace_dir / "analysis_manifest.json").write_text(
+        json.dumps({"job_id": workspace_dir.name, "status": "local_completed"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def test_resubmit_existing_analysis_reuses_local_asr_without_rerunning(tmp_path, monkeypatch) -> None:
+    workspace_dir = tmp_path / "analysis" / "job-existing"
+    _write_reusable_analysis_workspace(workspace_dir)
+    uploaded_payloads: list[dict] = []
+
+    def fake_upload(_self, payload):
+        uploaded_payloads.append(payload)
+        return {"job_id": "remote-2", "status": "completed", "report_url": "https://cloud/report"}
+
+    monkeypatch.setattr(CloudUploader, "upload_analysis", fake_upload)
+    monkeypatch.setattr(CloudUploader, "fetch_report_html", lambda *_args, **_kwargs: "<html>report</html>")
+    monkeypatch.setattr(
+        services.DesktopAnalysisService,
+        "_run_asr",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ASR should not run")),
+    )
+
+    settings = DesktopSettings(workspace_root=tmp_path, sqlite_path=tmp_path / "client.db")
+    repo = ClientJobRepository(settings.sqlite_path)
+    result = services.DesktopAnalysisService(settings, repo).resubmit_existing_analysis(
+        workspace_dir,
+        server_base_url="https://cloud.example.test",
+    )
+
+    row = repo.get_job("job-existing")
+    manifest = json.loads((workspace_dir / "analysis_manifest.json").read_text(encoding="utf-8"))
+    assert result.uploaded is True
+    assert result.remote_job_id == "remote-2"
+    assert row is not None
+    assert row["remote_job_id"] == "remote-2"
+    assert uploaded_payloads[0]["timeline"]["aligned_segments"]
+    assert manifest["cloud"]["remote_job_id"] == "remote-2"
+    assert manifest["cloud_submissions"][-1]["remote_job_id"] == "remote-2"
+
+
+def test_resubmit_existing_analysis_refuses_missing_asr_artifacts(tmp_path, monkeypatch) -> None:
+    workspace_dir = tmp_path / "analysis" / "job-incomplete"
+    workspace_dir.mkdir(parents=True)
+    (workspace_dir / "summary.md").write_text("# Summary", encoding="utf-8")
+    (workspace_dir / "detailed_timeline.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        CloudUploader,
+        "upload_analysis",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("upload should not run")),
+    )
+
+    settings = DesktopSettings(workspace_root=tmp_path, sqlite_path=tmp_path / "client.db")
+    repo = ClientJobRepository(settings.sqlite_path)
+    with pytest.raises(RuntimeError, match="Missing: transcript.json"):
+        services.DesktopAnalysisService(settings, repo).resubmit_existing_analysis(workspace_dir)
+
+
 def test_following_sync_adds_updates_and_removes_only_synced_profiles(tmp_path, monkeypatch) -> None:
     settings = DesktopSettings(workspace_root=tmp_path, sqlite_path=tmp_path / "client.db")
     repo = ClientJobRepository(settings.sqlite_path)

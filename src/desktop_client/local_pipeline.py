@@ -259,6 +259,8 @@ class DesktopAnalysisService:
                 summary_path=summary_path,
                 uploaded=False,
                 report_url=None,
+                remote_job_id=None,
+                cloud_status=None,
                 cloud_report_path=None,
                 asr_model_reference=model_reference,
                 asr_device=transcriber.last_used_device,
@@ -320,7 +322,7 @@ class DesktopAnalysisService:
             report_url = response.get("report_url")
             remote_status = str(response.get("status") or "")
             if remote_job_id and not report_url:
-                update_progress(0.9, f"等待云端报告生成：{remote_job_id}")
+                update_progress(0.9, f"等待云端报告生成：{remote_job_id}", remote_job_id=remote_job_id)
                 remote_result = uploader.wait_for_analysis_report(str(remote_job_id), timeout_seconds=120.0)
                 report_url = remote_result.get("report_url") or report_url
                 remote_status = str(remote_result.get("status") or remote_status)
@@ -345,6 +347,8 @@ class DesktopAnalysisService:
             final_message = "ASR completed; cloud report pending"
         elif uploaded and remote_job_id and not report_url and cloud_status_lower == "failed":
             final_message = "ASR completed; cloud report failed"
+        elif uploaded and remote_job_id and not report_url and cloud_status_lower == "cancelled":
+            final_message = "Cloud analysis cancelled"
         elif not asr_available:
             final_message = no_asr_upload_message
         else:
@@ -376,6 +380,8 @@ class DesktopAnalysisService:
             summary_path=summary_path,
             uploaded=uploaded,
             report_url=report_url,
+            remote_job_id=str(remote_job_id) if remote_job_id else None,
+            cloud_status=remote_status or None,
             cloud_report_path=cloud_report_path,
             asr_model_reference=model_reference,
             asr_device=transcriber.last_used_device,
@@ -387,6 +393,198 @@ class DesktopAnalysisService:
             asset_uri=None,
             offload_required=offload_required,
             summary_excerpt=self._build_summary_excerpt(timeline, analyses, diagnostics),
+        )
+
+    def resubmit_existing_analysis(
+        self,
+        workspace_dir: Path,
+        *,
+        server_base_url: str | None = None,
+        server_auth_token: str | None = None,
+        progress_callback: Callable[[float, str], None] | None = None,
+    ) -> DesktopAnalysisResult:
+        workspace_dir = Path(workspace_dir)
+        job_id = workspace_dir.name
+        summary_path = workspace_dir / "summary.md"
+        timeline_path = workspace_dir / "detailed_timeline.json"
+        transcript_path = workspace_dir / "transcript.json"
+        manifest_path = workspace_dir / "analysis_manifest.json"
+        timeline = self._load_reusable_timeline(
+            summary_path=summary_path,
+            timeline_path=timeline_path,
+            transcript_path=transcript_path,
+        )
+        summary_markdown = summary_path.read_text(encoding="utf-8")
+        source_assets = self._source_assets_from_existing_payload(timeline, manifest_path)
+        self._ensure_existing_analysis_job_row(job_id, workspace_dir, source_assets)
+
+        def update_progress(progress: float, message: str, **updates: Any) -> None:
+            payload = {"progress": progress, "message": message}
+            payload.update(updates)
+            self.repo.update_job(job_id, **payload)
+            if progress_callback:
+                progress_callback(progress, message)
+
+        debug_analysis = _env_flag("DSO_DEBUG_ANALYSIS")
+        uploader = CloudUploader(
+            server_base_url or self.settings.server_base_url,
+            auth_token=server_auth_token,
+            debug_dir=workspace_dir if debug_analysis else None,
+        )
+        update_progress(0.1, "Reusing local ASR; uploading to cloud", status="running")
+
+        uploaded = False
+        remote_job_id = None
+        remote_status = ""
+        report_url = None
+        cloud_report_path: Path | None = None
+        remote_result: dict[str, Any] | None = None
+        cloud_error: str | None = None
+        try:
+            response = uploader.upload_analysis(
+                {
+                    "client_job_id": job_id,
+                    "summary_markdown": summary_markdown,
+                    "timeline": timeline,
+                    "video_size_bytes": timeline.get("video_size_bytes"),
+                    "asset_storage": timeline.get("asset_storage"),
+                    "asset_uri": timeline.get("asset_uri"),
+                    "analysis_tier": timeline.get("analysis_tier") or "cloud_hotspot",
+                    "payment_required": timeline.get("payment_required"),
+                }
+            )
+            uploaded = True
+            remote_result = response
+            remote_job_id = response.get("job_id")
+            report_url = response.get("report_url")
+            remote_status = str(response.get("status") or "")
+            if remote_job_id and not report_url:
+                update_progress(0.7, f"Waiting for cloud report: {remote_job_id}", remote_job_id=remote_job_id)
+                remote_result = uploader.wait_for_analysis_report(str(remote_job_id), timeout_seconds=120.0)
+                report_url = remote_result.get("report_url") or report_url
+                remote_status = str(remote_result.get("status") or remote_status)
+            if report_url:
+                update_progress(0.9, "Downloading cloud report")
+                cloud_report_path = workspace_dir / "cloud_report.html"
+                cloud_report_path.write_text(uploader.fetch_report_html(str(report_url)), encoding="utf-8")
+        except Exception as exc:
+            cloud_error = str(exc)
+            update_progress(0.9, f"Cloud resubmit failed: {exc}")
+
+        cloud_status_lower = remote_status.strip().lower()
+        if uploaded and remote_job_id and not report_url and cloud_status_lower in {"queued", "running", "pending_worker"}:
+            final_message = "ASR reused; cloud report pending"
+        elif uploaded and remote_job_id and not report_url and cloud_status_lower == "failed":
+            final_message = "ASR reused; cloud report failed"
+        elif uploaded and remote_job_id and not report_url and cloud_status_lower == "cancelled":
+            final_message = "Cloud analysis cancelled"
+        elif cloud_error:
+            final_message = "ASR reused; cloud upload failed"
+        else:
+            final_message = "ASR reused; cloud report completed" if report_url else "ASR reused; cloud task submitted"
+
+        self._update_manifest_cloud_state(
+            manifest_path,
+            uploaded=uploaded,
+            remote_job_id=str(remote_job_id) if remote_job_id else None,
+            cloud_status=remote_status or None,
+            report_url=str(report_url) if report_url else None,
+            cloud_report_path=str(cloud_report_path) if cloud_report_path else None,
+            last_response=remote_result,
+            error=cloud_error,
+        )
+        update_progress(
+            1.0,
+            final_message,
+            status="completed" if uploaded else "failed",
+            remote_job_id=remote_job_id,
+            report_url=report_url,
+        )
+        return DesktopAnalysisResult(
+            job_id=job_id,
+            workspace_dir=workspace_dir,
+            transcript_path=transcript_path,
+            timeline_path=timeline_path,
+            summary_path=summary_path,
+            uploaded=uploaded,
+            report_url=report_url,
+            remote_job_id=str(remote_job_id) if remote_job_id else None,
+            cloud_status=remote_status or None,
+            cloud_report_path=cloud_report_path,
+            video_size_bytes=timeline.get("video_size_bytes"),
+            analysis_tier=timeline.get("analysis_tier") or "cloud_hotspot",
+            payment_required=bool(timeline.get("payment_required")),
+            asset_storage=timeline.get("asset_storage"),
+            asset_uri=timeline.get("asset_uri"),
+        )
+
+    def _load_reusable_timeline(
+        self,
+        *,
+        summary_path: Path,
+        timeline_path: Path,
+        transcript_path: Path,
+    ) -> dict[str, Any]:
+        missing = [
+            path.name
+            for path in (summary_path, timeline_path, transcript_path)
+            if not path.exists()
+        ]
+        if missing:
+            raise RuntimeError(
+                "Existing analysis is incomplete; run local analysis again. Missing: "
+                + ", ".join(missing)
+            )
+        try:
+            timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+            transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Existing analysis artifacts are invalid JSON: {exc}") from exc
+        if not isinstance(timeline, dict):
+            raise RuntimeError("Existing detailed_timeline.json is not a JSON object.")
+        if not isinstance(transcript, list) or not transcript:
+            raise RuntimeError("Existing transcript.json has no ASR segments; run local analysis again.")
+        if not timeline.get("aligned_segments"):
+            raise RuntimeError("Existing detailed_timeline.json has no aligned ASR segments; run local analysis again.")
+        if not timeline.get("transcript_chapters"):
+            raise RuntimeError("Existing detailed_timeline.json has no transcript chapters; run local analysis again.")
+        if not timeline.get("occupancy_timeline_blocks"):
+            raise RuntimeError("Existing detailed_timeline.json has no occupancy timeline blocks; run local analysis again.")
+        return timeline
+
+    def _source_assets_from_existing_payload(self, timeline: dict[str, Any], manifest_path: Path) -> dict[str, Any]:
+        source_assets = timeline.get("source_assets")
+        if isinstance(source_assets, dict):
+            return source_assets
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest_assets = manifest.get("source_assets")
+                if isinstance(manifest_assets, dict):
+                    return manifest_assets
+            except Exception:
+                pass
+        return {}
+
+    def _ensure_existing_analysis_job_row(
+        self,
+        job_id: str,
+        workspace_dir: Path,
+        source_assets: dict[str, Any],
+    ) -> None:
+        if self.repo.get_job(job_id) is not None:
+            return
+        self.repo.create_job(
+            {
+                "job_id": job_id,
+                "status": "queued",
+                "replay_path": str(source_assets.get("replay_path") or ""),
+                "occupancy_path": str(source_assets.get("occupancy_path") or ""),
+                "danmaku_path": str(source_assets.get("danmaku_path") or "") or None,
+                "workspace_dir": str(workspace_dir),
+                "progress": 0.0,
+                "message": "Existing analysis loaded for cloud resubmit",
+            }
         )
 
     def _update_manifest_cloud_state(
@@ -401,12 +599,14 @@ class DesktopAnalysisService:
         last_response: dict[str, Any] | None,
         error: str | None,
     ) -> None:
-        if not manifest_path.exists():
-            return
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            return
+        manifest: dict[str, Any] = {}
+        if manifest_path.exists():
+            try:
+                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    manifest = loaded
+            except Exception:
+                manifest = {}
         manifest["cloud"] = {
             "uploaded": uploaded,
             "remote_job_id": remote_job_id,
@@ -416,6 +616,22 @@ class DesktopAnalysisService:
             "last_response": last_response,
             "error": error,
         }
+        submissions = manifest.get("cloud_submissions")
+        if not isinstance(submissions, list):
+            submissions = []
+        submissions.append(
+            {
+                "submitted_at": datetime_now_iso(),
+                "uploaded": uploaded,
+                "remote_job_id": remote_job_id,
+                "status": cloud_status,
+                "report_url": report_url,
+                "cloud_report_path": cloud_report_path,
+                "last_response": last_response,
+                "error": error,
+            }
+        )
+        manifest["cloud_submissions"] = submissions
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _run_asr(

@@ -101,6 +101,7 @@ class _FakeCloudJob:
         self.error = None
         self.report_html = None
         self.report_path = None
+        self.rq_job_id = None
 
 
 class _FakeSession:
@@ -116,6 +117,9 @@ class _FakeSession:
 
     def commit(self) -> None:
         self.commits.append(self.job.status)
+
+    def refresh(self, _job) -> None:
+        return None
 
 
 class _FakeReportBuilder:
@@ -184,6 +188,57 @@ def test_generate_report_marks_failed_on_exception(monkeypatch, tmp_path) -> Non
     assert job.message == "Report generation failed"
     assert job.error == "DeepSeek timeout"
     assert json.loads(job.timeline_json)["analysis_selection"]["status"] == "failed"
+
+
+def test_cancel_enqueued_report_job_fetches_and_deletes_rq_job(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class FakeRqJob:
+        def cancel(self) -> None:
+            calls.append("cancel")
+
+        def delete(self) -> None:
+            calls.append("delete")
+
+    class FakeQueue:
+        def fetch_job(self, rq_job_id):
+            calls.append(f"fetch:{rq_job_id}")
+            return FakeRqJob()
+
+    monkeypatch.setattr(cloud_tasks, "queue", FakeQueue())
+
+    assert cloud_tasks.cancel_enqueued_report_job("rq-job-1") is True
+    assert calls == ["fetch:rq-job-1", "cancel", "delete"]
+
+
+def test_generate_report_stops_before_report_when_job_is_cancelled(monkeypatch, tmp_path) -> None:
+    job = _FakeCloudJob()
+    commits: list[str] = []
+
+    class CancellingSession(_FakeSession):
+        def refresh(self, _job) -> None:
+            self.job.status = "cancelled"
+            self.job.message = "Cloud analysis cancelled"
+
+    @contextmanager
+    def fake_get_session():
+        yield CancellingSession(job, commits)
+
+    monkeypatch.setattr(cloud_tasks, "get_session", fake_get_session)
+    monkeypatch.setattr(cloud_tasks, "ReportBuilder", _FakeReportBuilder)
+    monkeypatch.setattr(cloud_tasks.settings, "report_root", tmp_path)
+    monkeypatch.setattr(cloud_tasks, "_run_global_timeline_analysis", lambda timeline: timeline)
+    monkeypatch.setattr(
+        cloud_tasks,
+        "_run_deepseek_anchor_analysis",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("anchor analysis should not run")),
+    )
+
+    cloud_tasks.generate_report(job.job_id)
+
+    assert "completed" not in commits
+    assert job.status == "cancelled"
+    assert json.loads(job.timeline_json)["analysis_selection"]["status"] == "cancelled"
 
 
 def _anchor_payload(anchor_id: str, timestamp: float) -> dict:

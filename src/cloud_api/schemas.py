@@ -24,6 +24,7 @@ class AnalysisJobResponse(BaseModel):
     message: str | None = None
     error: str | None = None
     updated_at: datetime | None = None
+    rq_job_id: str | None = None
 
 
 class ClipCandidatesRequest(BaseModel):
