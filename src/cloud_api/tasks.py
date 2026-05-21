@@ -51,6 +51,18 @@ def generate_report(job_id: str) -> None:
             if analysis_job is None:
                 return
             timeline = json.loads(analysis_job.timeline_json)
+            timeline["global_analysis"] = {
+                "status": "running",
+                "started_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            }
+            analysis_job.status = "running"
+            analysis_job.message = "Global timeline analysis running"
+            analysis_job.error = None
+            analysis_job.timeline_json = json.dumps(timeline, ensure_ascii=False)
+            session.add(analysis_job)
+            session.commit()
+
+            timeline = _run_global_timeline_analysis(timeline)
             selection = _select_anchors_for_deepseek(timeline, max_anchors=settings.deepseek_max_anchors)
             timeline["analysis_selection"] = {
                 **selection,
@@ -348,6 +360,185 @@ def _run_deepseek_anchor_analysis(
     return timeline
 
 
+def _run_global_timeline_analysis(timeline: dict[str, Any]) -> dict[str, Any]:
+    global_state = timeline.setdefault("global_analysis", {})
+    if not settings.deepseek_api_key.strip():
+        global_state["status"] = "skipped_missing_deepseek_key"
+        global_state["error"] = "DEEPSEEK_API_KEY is not configured on the cloud server."
+        return timeline
+    chapters = list(timeline.get("transcript_chapters") or [])
+    occupancy_blocks = list(timeline.get("occupancy_timeline_blocks") or [])
+    if not chapters and not occupancy_blocks:
+        global_state["status"] = "skipped_no_global_inputs"
+        return timeline
+
+    model_id = _provider_model_id(settings.deepseek_model_id, settings.deepseek_base_url)
+    payload = {
+        "model": model_id,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是直播复盘分析师。请先从整场 ASR 章节和完整人数走势中判断直播节奏、"
+                    "主题变化、持续高位、慢热铺垫、流失和恢复区间。弹幕不可用时不要假设观众反馈。"
+                    "必须返回 JSON。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": _build_global_timeline_prompt(timeline),
+            },
+        ],
+        "temperature": 0.2,
+    }
+    try:
+        response = requests.post(
+            f"{settings.deepseek_base_url.rstrip('/')}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {settings.deepseek_api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=max(float(settings.deepseek_timeout_seconds), 180.0),
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"HTTP {response.status_code} from DeepSeek: {response.text[:1000]}")
+        raw = response.json()
+        content = _extract_chat_content(raw)
+        parsed: dict[str, Any] | None = None
+        try:
+            parsed = _parse_json_object(content)
+        except Exception:
+            parsed = None
+        global_state.update(
+            {
+                "status": "completed",
+                "model_id": model_id,
+                "response_text": content,
+                "parsed": parsed,
+                "candidate_intervals": _normalize_candidate_intervals(
+                    (parsed or {}).get("candidate_intervals")
+                    or (parsed or {}).get("hotspot_intervals")
+                    or []
+                ),
+            }
+        )
+    except Exception as exc:
+        global_state.update({"status": "failed", "error": str(exc)[:2000]})
+    return timeline
+
+
+def _build_global_timeline_prompt(timeline: dict[str, Any]) -> str:
+    coverage = timeline.get("coverage") or {}
+    payload = {
+        "instructions": [
+            "只根据 ASR 章节和人数走势分析，不要假设弹幕、商品或成交数据。",
+            "请找出非突增型爆点、持续高位、慢热铺垫、话题转折、恢复和流失区间。",
+            "返回 JSON：overall_summary, rhythm, candidate_intervals, uncertainty。",
+            "candidate_intervals 每项包含 start, end, title, reason, confidence, evidence_chapter_ids。",
+        ],
+        "coverage": {
+            "asr_available": coverage.get("asr_available"),
+            "danmaku_available": coverage.get("danmaku_available"),
+            "timeline_start": coverage.get("timeline_start"),
+            "timeline_end": coverage.get("timeline_end"),
+        },
+        "occupancy_summary": timeline.get("occupancy_summary") or {},
+        "occupancy_timeline_blocks": _compact_occupancy_blocks(
+            timeline.get("occupancy_timeline_blocks") or []
+        ),
+        "transcript_chapters": _compact_transcript_chapters(
+            timeline.get("transcript_chapters") or []
+        ),
+        "anchor_index": _compact_anchor_index(timeline.get("anchors") or []),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _compact_occupancy_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "block_id": block.get("block_id"),
+            "start": block.get("start"),
+            "end": block.get("end"),
+            "count_start": block.get("count_start"),
+            "count_end": block.get("count_end"),
+            "count_min": block.get("count_min"),
+            "count_max": block.get("count_max"),
+            "count_mean": block.get("count_mean"),
+            "delta": block.get("delta"),
+            "slope_per_min": block.get("slope_per_min"),
+            "relative_level": block.get("relative_level"),
+            "movement": block.get("movement"),
+        }
+        for block in blocks
+    ]
+
+
+def _compact_transcript_chapters(chapters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compact = []
+    for chapter in chapters:
+        text = str(chapter.get("text_excerpt") or "")
+        compact.append(
+            {
+                "chapter_id": chapter.get("chapter_id"),
+                "start": chapter.get("start"),
+                "end": chapter.get("end"),
+                "segment_count": chapter.get("segment_count"),
+                "text_excerpt": text[:1800],
+                "nearby_anchor_ids": chapter.get("nearby_anchor_ids") or [],
+                "occupancy": chapter.get("occupancy") or {},
+            }
+        )
+    return compact
+
+
+def _compact_anchor_index(anchors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "anchor_id": anchor.get("anchor_id"),
+            "timestamp": anchor.get("timestamp"),
+            "direction": anchor.get("direction"),
+            "score": anchor.get("score"),
+            "priority": anchor.get("priority"),
+            "abs_change": anchor.get("abs_change"),
+            "baseline_count": anchor.get("baseline_count"),
+            "target_count": anchor.get("target_count"),
+            "reason_hint": anchor.get("reason_hint"),
+        }
+        for anchor in anchors[:120]
+    ]
+
+
+def _normalize_candidate_intervals(intervals: Any) -> list[dict[str, Any]]:
+    if not isinstance(intervals, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in intervals:
+        if not isinstance(item, dict):
+            continue
+        start = item.get("start", item.get("start_seconds"))
+        end = item.get("end", item.get("end_seconds"))
+        try:
+            start_f = float(start)
+            end_f = float(end)
+        except (TypeError, ValueError):
+            continue
+        if end_f < start_f:
+            start_f, end_f = end_f, start_f
+        normalized.append(
+            {
+                "start": round(start_f, 4),
+                "end": round(end_f, 4),
+                "title": item.get("title"),
+                "reason": item.get("reason"),
+                "confidence": item.get("confidence"),
+                "evidence_chapter_ids": item.get("evidence_chapter_ids") or [],
+            }
+        )
+    return normalized
+
+
 def _select_anchors_for_deepseek(timeline: dict[str, Any], max_anchors: int) -> dict[str, Any]:
     anchors = list(timeline.get("anchors") or [])
     bounded_max = min(100, max(10, int(max_anchors or 40)))
@@ -373,7 +564,17 @@ def _select_anchors_for_deepseek(timeline: dict[str, Any], max_anchors: int) -> 
         ),
         reverse=True,
     )
-    selected = ranked[:target_count]
+    candidate_intervals = _global_candidate_intervals(timeline)
+    preferred = [anchor for anchor in ranked if _anchor_in_intervals(anchor, candidate_intervals)]
+    selected = preferred[:target_count]
+    if len(selected) < target_count:
+        selected_ids_seed = {anchor.get("anchor_id") for anchor in selected}
+        selected.extend(
+            anchor
+            for anchor in ranked
+            if anchor.get("anchor_id") not in selected_ids_seed
+        )
+        selected = selected[:target_count]
     selected_ids = {anchor.get("anchor_id") for anchor in selected}
     weak_ids = [
         anchor.get("anchor_id")
@@ -382,16 +583,38 @@ def _select_anchors_for_deepseek(timeline: dict[str, Any], max_anchors: int) -> 
     ]
     return {
         "status": "selected",
-        "strategy": "dynamic_by_duration_score_distribution",
+        "strategy": (
+            "global_candidate_intervals_then_anchor_score"
+            if candidate_intervals
+            else "dynamic_by_duration_score_distribution"
+        ),
         "max_anchors": bounded_max,
         "duration_minutes": round(duration_minutes, 4),
         "total_anchor_count": len(anchors),
         "high_score_anchor_count": high_score_count,
+        "global_candidate_interval_count": len(candidate_intervals),
+        "global_preferred_anchor_count": len(preferred),
         "selected_anchor_count": len(selected),
         "weak_anchor_count": len(weak_ids),
         "selected_anchor_ids": [anchor.get("anchor_id") for anchor in sorted(selected, key=lambda item: float(item.get("timestamp") or 0))],
         "weak_anchor_ids": weak_ids,
     }
+
+
+def _global_candidate_intervals(timeline: dict[str, Any]) -> list[dict[str, Any]]:
+    global_analysis = timeline.get("global_analysis") or {}
+    intervals = global_analysis.get("candidate_intervals") or []
+    return _normalize_candidate_intervals(intervals)
+
+
+def _anchor_in_intervals(anchor: dict[str, Any], intervals: list[dict[str, Any]]) -> bool:
+    if not intervals:
+        return False
+    try:
+        timestamp = float(anchor.get("timestamp"))
+    except (TypeError, ValueError):
+        return False
+    return any(float(interval["start"]) <= timestamp <= float(interval["end"]) for interval in intervals)
 
 
 def _duration_minutes(timeline: dict[str, Any]) -> float:
@@ -453,9 +676,16 @@ def _danmaku_from_dict(payload: dict[str, Any]) -> DanmakuStats:
 
 
 def _related_segments(anchor: AnchorEvent, segments: list[AlignedSegment]) -> list[AlignedSegment]:
-    direct = [segment for segment in segments if anchor.anchor_id in segment.nearby_anchor_ids]
+    context_start = anchor.timestamp - 180.0
+    context_end = anchor.timestamp + 180.0
+    direct = [
+        segment
+        for segment in segments
+        if anchor.anchor_id in segment.nearby_anchor_ids
+        or (segment.end >= context_start and segment.start <= context_end)
+    ]
     if direct:
-        return direct
+        return sorted(direct, key=lambda segment: (segment.start, segment.end))
     return sorted(
         segments,
         key=lambda segment: min(abs(segment.start - anchor.timestamp), abs(segment.end - anchor.timestamp)),

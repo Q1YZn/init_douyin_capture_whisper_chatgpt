@@ -89,6 +89,15 @@ class AnchorEvent:
     target_count: int
     slope_per_min: float | None = None
     reason_hint: str | None = None
+    score: float = 0.0
+    priority: str = "weak"
+    abs_change_score: float = 0.0
+    pct_change_score: float = 0.0
+    distribution_score: float = 0.0
+    slope_score: float = 0.0
+    peak_trough_score: float = 0.0
+    relative_level: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -115,10 +124,16 @@ class DetailedTimeline:
     aligned_segments: list[AlignedSegment]
     anchors: list[AnchorEvent]
     coverage: dict[str, Any]
+    occupancy_summary: dict[str, Any] = field(default_factory=dict)
+    occupancy_timeline_blocks: list[dict[str, Any]] = field(default_factory=list)
+    transcript_chapters: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "aligned_segments": [segment.to_dict() for segment in self.aligned_segments],
             "anchors": [anchor.to_dict() for anchor in self.anchors],
             "coverage": self.coverage,
+            "occupancy_summary": self.occupancy_summary,
+            "occupancy_timeline_blocks": self.occupancy_timeline_blocks,
+            "transcript_chapters": self.transcript_chapters,
         }

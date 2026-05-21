@@ -60,6 +60,34 @@ class ReportBuilder:
         ]
         if upstream_summary:
             lines.extend(["## Client Summary", "", upstream_summary, ""])
+        global_analysis = timeline.get("global_analysis") or {}
+        if global_analysis:
+            lines.extend(["## Global Timeline Analysis", ""])
+            lines.append(f"- Status: {global_analysis.get('status')}")
+            candidate_intervals = global_analysis.get("candidate_intervals") or []
+            if candidate_intervals:
+                lines.append(f"- Candidate intervals: {len(candidate_intervals)}")
+            if global_analysis.get("response_text"):
+                lines.append("")
+                lines.append(str(global_analysis.get("response_text")))
+            if global_analysis.get("error"):
+                lines.append(f"- Error: {global_analysis.get('error')}")
+            lines.append("")
+        occupancy_blocks = timeline.get("occupancy_timeline_blocks") or []
+        if occupancy_blocks:
+            lines.extend(["## Occupancy Timeline Blocks", ""])
+            lines.append("| Time | Start -> End | Min / Max | Movement | Level |")
+            lines.append("| --- | ---: | ---: | --- | --- |")
+            for block in occupancy_blocks[:60]:
+                lines.append(
+                    "| "
+                    f"{block.get('start')}s-{block.get('end')}s | "
+                    f"{block.get('count_start')} -> {block.get('count_end')} | "
+                    f"{block.get('count_min')} / {block.get('count_max')} | "
+                    f"{block.get('movement')} | "
+                    f"{block.get('relative_level')} |"
+                )
+            lines.append("")
         if any(
             timeline.get(key) is not None
             for key in ("video_size_bytes", "asset_storage", "asset_uri", "analysis_tier", "payment_required")

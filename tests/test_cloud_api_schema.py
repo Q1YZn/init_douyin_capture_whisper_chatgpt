@@ -154,7 +154,7 @@ def test_generate_report_marks_running_then_completed(monkeypatch, tmp_path) -> 
 
     cloud_tasks.generate_report(job.job_id)
 
-    assert commits == ["running", "completed"]
+    assert commits == ["running", "running", "completed"]
     assert job.status == "completed"
     assert job.message == "Report completed"
     assert job.error is None
@@ -179,7 +179,7 @@ def test_generate_report_marks_failed_on_exception(monkeypatch, tmp_path) -> Non
     with pytest.raises(RuntimeError, match="DeepSeek timeout"):
         cloud_tasks.generate_report(job.job_id)
 
-    assert commits == ["running", "failed"]
+    assert commits == ["running", "running", "failed"]
     assert job.status == "failed"
     assert job.message == "Report generation failed"
     assert job.error == "DeepSeek timeout"
@@ -242,6 +242,34 @@ def _timeline_for_anchor_concurrency() -> dict:
             for anchor in anchors
         ],
         "occupancy_summary": {"duration_minutes": 30},
+        "coverage": {"asr_available": True, "danmaku_available": False, "timeline_start": 0, "timeline_end": 60},
+        "occupancy_timeline_blocks": [
+            {
+                "block_id": "occ_0000",
+                "start": 0,
+                "end": 60,
+                "count_start": 1000,
+                "count_end": 1100,
+                "count_min": 900,
+                "count_max": 1200,
+                "count_mean": 1050,
+                "delta": 100,
+                "slope_per_min": 100,
+                "relative_level": "p75_to_p90",
+                "movement": "rising",
+            }
+        ],
+        "transcript_chapters": [
+            {
+                "chapter_id": "chapter_0000",
+                "start": 0,
+                "end": 60,
+                "segment_count": 6,
+                "text_excerpt": "complete transcript view",
+                "nearby_anchor_ids": ["anchor_0001"],
+                "occupancy": {"movement": "rising"},
+            }
+        ],
     }
 
 
@@ -330,3 +358,84 @@ def test_deepseek_anchor_analysis_keeps_report_when_one_anchor_fails(monkeypatch
     failed = [item for item in analyses if item["status"] == "error"]
     assert failed[0]["anchor_id"] == "anchor_0002"
     assert failed[0]["error"] == "rate limited"
+
+
+def test_global_timeline_analysis_uses_chapters_and_occupancy_blocks(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "overall_summary": "global view",
+                                    "candidate_intervals": [
+                                        {
+                                            "start": 10,
+                                            "end": 30,
+                                            "title": "slow burn",
+                                            "reason": "ASR and occupancy rose together",
+                                            "confidence": 0.8,
+                                            "evidence_chapter_ids": ["chapter_0000"],
+                                        }
+                                    ],
+                                    "uncertainty": "danmaku unavailable",
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+    def fake_post(_url, **kwargs):
+        captured["payload"] = kwargs["json"]
+        return FakeResponse()
+
+    monkeypatch.setattr(cloud_tasks.settings, "deepseek_api_key", "key")
+    monkeypatch.setattr(cloud_tasks.requests, "post", fake_post)
+
+    timeline = cloud_tasks._run_global_timeline_analysis(_timeline_for_anchor_concurrency())
+
+    user_content = captured["payload"]["messages"][1]["content"]
+    assert "complete transcript view" in user_content
+    assert "occupancy_timeline_blocks" in user_content
+    assert "danmaku_available" in user_content
+    assert timeline["global_analysis"]["status"] == "completed"
+    assert timeline["global_analysis"]["candidate_intervals"][0]["start"] == 10.0
+
+
+def test_global_candidate_intervals_influence_anchor_selection() -> None:
+    timeline = _timeline_for_anchor_concurrency()
+    timeline["global_analysis"] = {
+        "candidate_intervals": [
+            {"start": 45, "end": 65, "title": "late topic"},
+        ]
+    }
+
+    selection = cloud_tasks._select_anchors_for_deepseek(timeline, max_anchors=3)
+
+    assert selection["strategy"] == "global_candidate_intervals_then_anchor_score"
+    assert selection["global_candidate_interval_count"] == 1
+    assert selection["global_preferred_anchor_count"] == 2
+    assert {"anchor_0005", "anchor_0006"}.issubset(set(selection["selected_anchor_ids"]))
+
+
+def test_global_analysis_failure_keeps_anchor_fallback(monkeypatch) -> None:
+    def fake_post(_url, **_kwargs):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(cloud_tasks.settings, "deepseek_api_key", "key")
+    monkeypatch.setattr(cloud_tasks.requests, "post", fake_post)
+
+    timeline = cloud_tasks._run_global_timeline_analysis(_timeline_for_anchor_concurrency())
+    selection = cloud_tasks._select_anchors_for_deepseek(timeline, max_anchors=3)
+
+    assert timeline["global_analysis"]["status"] == "failed"
+    assert selection["strategy"] == "dynamic_by_duration_score_distribution"
+    assert selection["selected_anchor_count"] > 0
