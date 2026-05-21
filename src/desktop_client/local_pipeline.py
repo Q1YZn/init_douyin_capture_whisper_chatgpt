@@ -47,6 +47,18 @@ class DesktopAnalysisService:
         request: DesktopAnalysisRequest,
         progress_callback: Callable[[float, str], None] | None = None,
     ) -> DesktopAnalysisResult:
+        if not _env_flag("DSO_FORCE_LOCAL_REANALYSIS"):
+            reusable_workspace = self._find_reusable_analysis_workspace(request)
+            if reusable_workspace is not None:
+                if progress_callback:
+                    progress_callback(0.02, f"Reusing existing ASR artifacts: {reusable_workspace.name}")
+                return self.resubmit_existing_analysis(
+                    reusable_workspace,
+                    server_base_url=request.server_base_url,
+                    server_auth_token=request.server_auth_token,
+                    progress_callback=progress_callback,
+                )
+
         job_id = uuid.uuid4().hex
         workspace_dir = request.workspace_dir / job_id
         workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -416,6 +428,15 @@ class DesktopAnalysisService:
         )
         summary_markdown = summary_path.read_text(encoding="utf-8")
         source_assets = self._source_assets_from_existing_payload(timeline, manifest_path)
+        if not timeline.get("transcript_chapters") or not timeline.get("occupancy_timeline_blocks"):
+            timeline = self._rebuild_timeline_from_existing_transcript(
+                workspace_dir=workspace_dir,
+                timeline=timeline,
+                transcript_path=transcript_path,
+                manifest_path=manifest_path,
+                source_assets=source_assets,
+            )
+            timeline_path.write_text(json.dumps(timeline, ensure_ascii=False, indent=2), encoding="utf-8")
         self._ensure_existing_analysis_job_row(job_id, workspace_dir, source_assets)
 
         def update_progress(progress: float, message: str, **updates: Any) -> None:
@@ -518,6 +539,56 @@ class DesktopAnalysisService:
             asset_uri=timeline.get("asset_uri"),
         )
 
+    def _find_reusable_analysis_workspace(self, request: DesktopAnalysisRequest) -> Path | None:
+        root = Path(request.workspace_dir)
+        if not root.exists():
+            return None
+        candidates: list[Path]
+        if (root / "detailed_timeline.json").exists():
+            candidates = [root]
+        else:
+            candidates = [path for path in root.iterdir() if path.is_dir()]
+            candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        for candidate in candidates:
+            summary_path = candidate / "summary.md"
+            timeline_path = candidate / "detailed_timeline.json"
+            transcript_path = candidate / "transcript.json"
+            manifest_path = candidate / "analysis_manifest.json"
+            try:
+                timeline = self._load_reusable_timeline(
+                    summary_path=summary_path,
+                    timeline_path=timeline_path,
+                    transcript_path=transcript_path,
+                )
+            except RuntimeError:
+                continue
+            source_assets = self._source_assets_from_existing_payload(timeline, manifest_path)
+            if self._source_assets_match_request(source_assets, request):
+                return candidate
+        return None
+
+    def _source_assets_match_request(
+        self,
+        source_assets: dict[str, Any],
+        request: DesktopAnalysisRequest,
+    ) -> bool:
+        replay_path = source_assets.get("replay_path")
+        if not replay_path:
+            return False
+        if not self._same_path(Path(str(replay_path)), request.replay_path):
+            return False
+        occupancy_path = source_assets.get("occupancy_path")
+        if occupancy_path and not self._same_path(Path(str(occupancy_path)), request.occupancy_path):
+            return False
+        return True
+
+    @staticmethod
+    def _same_path(left: Path, right: Path) -> bool:
+        try:
+            return left.resolve() == right.resolve()
+        except OSError:
+            return os.path.normcase(str(left)) == os.path.normcase(str(right))
+
     def _load_reusable_timeline(
         self,
         *,
@@ -546,11 +617,69 @@ class DesktopAnalysisService:
             raise RuntimeError("Existing transcript.json has no ASR segments; run local analysis again.")
         if not timeline.get("aligned_segments"):
             raise RuntimeError("Existing detailed_timeline.json has no aligned ASR segments; run local analysis again.")
-        if not timeline.get("transcript_chapters"):
-            raise RuntimeError("Existing detailed_timeline.json has no transcript chapters; run local analysis again.")
-        if not timeline.get("occupancy_timeline_blocks"):
-            raise RuntimeError("Existing detailed_timeline.json has no occupancy timeline blocks; run local analysis again.")
         return timeline
+
+    def _rebuild_timeline_from_existing_transcript(
+        self,
+        *,
+        workspace_dir: Path,
+        timeline: dict[str, Any],
+        transcript_path: Path,
+        manifest_path: Path,
+        source_assets: dict[str, Any],
+    ) -> dict[str, Any]:
+        transcript_segments = json.loads(transcript_path.read_text(encoding="utf-8"))
+        if not isinstance(transcript_segments, list) or not transcript_segments:
+            raise RuntimeError("Existing transcript.json has no ASR segments; run local analysis again.")
+        occupancy_path = Path(str(source_assets.get("occupancy_path") or ""))
+        if not occupancy_path.exists():
+            raise RuntimeError("Existing analysis cannot be upgraded because occupancy_path is missing.")
+        danmaku_value = source_assets.get("danmaku_path")
+        danmaku_path = Path(str(danmaku_value)) if danmaku_value else None
+        aligner = DataAligner(AlignmentConfig())
+        occupancy_df = aligner.load_occupancy_history(occupancy_path)
+        danmaku_df = (
+            aligner.load_danmaku_history(danmaku_path)
+            if danmaku_path and danmaku_path.exists()
+            else None
+        )
+        rebuilt = aligner.build_timeline(transcript_segments, occupancy_df, danmaku_df=danmaku_df)
+        payload = rebuilt.to_dict()
+        payload["agent_analyses"] = []
+        selected_anchors = self._select_anchors_for_analysis(rebuilt)
+        payload["analysis_selection"] = {
+            "status": "client_structured_selected",
+            "strategy": "dynamic_by_duration_score_distribution",
+            "max_anchors": self._deepseek_max_anchors(),
+            "total_anchor_count": len(rebuilt.anchors),
+            "selected_anchor_count": len(selected_anchors),
+            "weak_anchor_count": max(0, len(rebuilt.anchors) - len(selected_anchors)),
+            "selected_anchor_ids": [anchor.anchor_id for anchor in selected_anchors],
+            "weak_anchor_ids": [anchor.anchor_id for anchor in rebuilt.anchors if anchor not in selected_anchors],
+        }
+        payload["job_id"] = timeline.get("job_id") or workspace_dir.name
+        payload["diagnostics"] = list(timeline.get("diagnostics") or []) + [
+            "Rebuilt timeline from existing transcript.json; ASR was not rerun."
+        ]
+        for key in (
+            "video_size_bytes",
+            "asset_storage",
+            "asset_uri",
+            "analysis_tier",
+            "payment_required",
+            "asr_runtime",
+        ):
+            if key in timeline:
+                payload[key] = timeline[key]
+        payload["source_assets"] = source_assets
+        if "asr_runtime" not in payload and manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(manifest, dict) and isinstance(manifest.get("asr_runtime"), dict):
+                    payload["asr_runtime"] = manifest["asr_runtime"]
+            except Exception:
+                pass
+        return payload
 
     def _source_assets_from_existing_payload(self, timeline: dict[str, Any], manifest_path: Path) -> dict[str, Any]:
         source_assets = timeline.get("source_assets")

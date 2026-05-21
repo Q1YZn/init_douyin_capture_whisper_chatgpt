@@ -421,28 +421,35 @@ def test_cloud_uploader_debug_files_exclude_authorization_token(tmp_path, monkey
     assert "remote-1" in poll_text
 
 
-def _write_reusable_analysis_workspace(workspace_dir: Path) -> None:
+def _write_reusable_analysis_workspace(
+    workspace_dir: Path,
+    *,
+    replay_path: Path | None = None,
+    occupancy_path: Path | None = None,
+    include_global_blocks: bool = True,
+) -> None:
     workspace_dir.mkdir(parents=True, exist_ok=True)
+    replay_path = replay_path or workspace_dir.parent / "replay.flv"
+    occupancy_path = occupancy_path or workspace_dir.parent / "occupants.csv"
     (workspace_dir / "summary.md").write_text("# Summary", encoding="utf-8")
     (workspace_dir / "transcript.json").write_text(
         json.dumps([{"start": 0, "end": 2, "text": "hello"}], ensure_ascii=False),
         encoding="utf-8",
     )
+    timeline = {
+        "job_id": workspace_dir.name,
+        "aligned_segments": [{"start": 0, "end": 2, "text": "hello"}],
+        "source_assets": {
+            "replay_path": str(replay_path),
+            "occupancy_path": str(occupancy_path),
+            "danmaku_path": None,
+        },
+    }
+    if include_global_blocks:
+        timeline["transcript_chapters"] = [{"chapter_id": "chapter_0000", "start": 0, "end": 120}]
+        timeline["occupancy_timeline_blocks"] = [{"block_id": "occ_0000", "start": 0, "end": 120}]
     (workspace_dir / "detailed_timeline.json").write_text(
-        json.dumps(
-            {
-                "job_id": workspace_dir.name,
-                "aligned_segments": [{"start": 0, "end": 2, "text": "hello"}],
-                "transcript_chapters": [{"chapter_id": "chapter_0000", "start": 0, "end": 120}],
-                "occupancy_timeline_blocks": [{"block_id": "occ_0000", "start": 0, "end": 120}],
-                "source_assets": {
-                    "replay_path": str(workspace_dir.parent / "replay.flv"),
-                    "occupancy_path": str(workspace_dir.parent / "occupants.csv"),
-                    "danmaku_path": None,
-                },
-            },
-            ensure_ascii=False,
-        ),
+        json.dumps(timeline, ensure_ascii=False),
         encoding="utf-8",
     )
     (workspace_dir / "analysis_manifest.json").write_text(
@@ -501,6 +508,47 @@ def test_resubmit_existing_analysis_refuses_missing_asr_artifacts(tmp_path, monk
     repo = ClientJobRepository(settings.sqlite_path)
     with pytest.raises(RuntimeError, match="Missing: transcript.json"):
         services.DesktopAnalysisService(settings, repo).resubmit_existing_analysis(workspace_dir)
+
+
+def test_run_reuses_existing_asr_for_same_replay_instead_of_rerunning(tmp_path, monkeypatch) -> None:
+    request = _make_analysis_request(tmp_path)
+    workspace_dir = request.workspace_dir / "job-existing"
+    _write_reusable_analysis_workspace(
+        workspace_dir,
+        replay_path=request.replay_path,
+        occupancy_path=request.occupancy_path,
+        include_global_blocks=False,
+    )
+    uploaded_payloads: list[dict] = []
+
+    def fake_upload(_self, payload):
+        uploaded_payloads.append(payload)
+        return {"job_id": "remote-3", "status": "queued", "report_url": None}
+
+    monkeypatch.setattr(CloudUploader, "upload_analysis", fake_upload)
+    monkeypatch.setattr(
+        CloudUploader,
+        "wait_for_analysis_report",
+        lambda *_args, **_kwargs: {"job_id": "remote-3", "status": "queued", "report_url": None},
+    )
+    monkeypatch.setattr(
+        services.DesktopAnalysisService,
+        "_run_asr",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ASR should not run")),
+    )
+
+    settings = DesktopSettings(workspace_root=tmp_path, sqlite_path=tmp_path / "client.db")
+    repo = ClientJobRepository(settings.sqlite_path)
+    result = services.DesktopAnalysisService(settings, repo).run(request)
+
+    assert result.job_id == "job-existing"
+    assert result.remote_job_id == "remote-3"
+    assert uploaded_payloads
+    timeline = uploaded_payloads[0]["timeline"]
+    assert timeline["aligned_segments"]
+    assert timeline["transcript_chapters"]
+    assert timeline["occupancy_timeline_blocks"]
+    assert "Rebuilt timeline from existing transcript.json; ASR was not rerun." in timeline["diagnostics"]
 
 
 def test_following_sync_adds_updates_and_removes_only_synced_profiles(tmp_path, monkeypatch) -> None:
