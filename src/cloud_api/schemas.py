@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class AnalysisJobCreate(BaseModel):
@@ -20,3 +21,23 @@ class AnalysisJobResponse(BaseModel):
     job_id: str
     status: str
     report_url: str | None = None
+    message: str | None = None
+    error: str | None = None
+    updated_at: datetime | None = None
+
+
+class ClipCandidatesRequest(BaseModel):
+    client_job_id: str
+    timeline: dict[str, Any]
+    summary_markdown: str | None = None
+    max_candidates: int | None = 20
+
+
+class ClipCandidatesResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    job_id: str
+    status: str
+    candidates: list[dict[str, Any]]
+    model_id: str | None = None
+    raw_response: str | None = None

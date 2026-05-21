@@ -1,0 +1,52 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    restart: unless-stopped
+    depends_on:
+      - redis
+    environment:
+      DATABASE_URL: sqlite:////data/cloud_api.db
+      REDIS_URL: redis://redis:6379/0
+      REPORT_ROOT: /data/server_reports
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:8000}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL_ID: ${DEEPSEEK_MODEL_ID:-deepseek-chat}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MAX_ANCHORS: ${DEEPSEEK_MAX_ANCHORS:-40}
+      DEEPSEEK_TIMEOUT_SECONDS: ${DEEPSEEK_TIMEOUT_SECONDS:-120}
+      REPORT_JOB_TIMEOUT_SECONDS: ${REPORT_JOB_TIMEOUT_SECONDS:-3600}
+    ports:
+      - "8000:8000"
+    volumes:
+      - dso-cloud-data:/data
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    restart: unless-stopped
+    depends_on:
+      - redis
+    command: ["python", "scripts/start_worker.py"]
+    environment:
+      DATABASE_URL: sqlite:////data/cloud_api.db
+      REDIS_URL: redis://redis:6379/0
+      REPORT_ROOT: /data/server_reports
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:8000}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL_ID: ${DEEPSEEK_MODEL_ID:-deepseek-chat}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MAX_ANCHORS: ${DEEPSEEK_MAX_ANCHORS:-40}
+      DEEPSEEK_TIMEOUT_SECONDS: ${DEEPSEEK_TIMEOUT_SECONDS:-120}
+      REPORT_JOB_TIMEOUT_SECONDS: ${REPORT_JOB_TIMEOUT_SECONDS:-3600}
+    volumes:
+      - dso-cloud-data:/data
+
+volumes:
+  dso-cloud-data:

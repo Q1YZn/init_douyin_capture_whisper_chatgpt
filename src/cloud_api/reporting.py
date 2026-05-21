@@ -15,14 +15,43 @@ class ReportBuilder:
 
     def build_markdown(self, timeline: dict[str, Any], upstream_summary: str | None = None) -> str:
         keywords = self._extract_keywords(timeline)
+        coverage = timeline.get("coverage", {})
+        summary = timeline.get("occupancy_summary") or coverage.get("occupancy_summary") or {}
+        selection = timeline.get("analysis_selection") or {}
         lines = [
             "# Cloud Replay Report",
             "",
             "## Overview",
             "",
-            f"- Anchor count: {len(timeline.get('anchors', []))}",
+            f"- All detected anchors: {len(timeline.get('anchors', []))}",
+            f"- DeepSeek analyzed anchors: {selection.get('selected_anchor_count', len(timeline.get('agent_analyses', [])))}",
+            f"- Unanalyzed weak anchors: {selection.get('weak_anchor_count', 0)}",
             f"- Segment count: {len(timeline.get('aligned_segments', []))}",
-            f"- Danmaku count: {timeline.get('coverage', {}).get('danmaku_message_count')}",
+            f"- Danmaku count: {coverage.get('danmaku_message_count')}",
+            f"- Analysis selection status: {selection.get('status', 'not_run')}",
+            "",
+            "## Occupancy Summary",
+            "",
+            f"- Duration minutes: {summary.get('duration_minutes')}",
+            f"- Samples: {summary.get('sample_count')}",
+            f"- Mean / Median: {summary.get('mean')} / {summary.get('median')}",
+            f"- Max / Min: {summary.get('max')} / {summary.get('min')}",
+            f"- P25 / P75 / P90: {summary.get('p25')} / {summary.get('p75')} / {summary.get('p90')}",
+            f"- IQR / Stddev / CV: {summary.get('iqr')} / {summary.get('stddev')} / {summary.get('coefficient_of_variation')}",
+            "",
+            "## Anchor Selection",
+            "",
+            f"- Strategy: {selection.get('strategy', 'unknown')}",
+            f"- Max anchors: {selection.get('max_anchors')}",
+            f"- High score anchors: {selection.get('high_score_anchor_count')}",
+            f"- Selected anchor IDs: {', '.join(selection.get('selected_anchor_ids') or []) or 'None'}",
+            "",
+            "## Missing Data Notes",
+            "",
+            f"- ASR available: {coverage.get('asr_available')}",
+            f"- Danmaku available: {coverage.get('danmaku_available')}",
+            "- Product, order and transaction data: not provided in current timeline.",
+            "- Missing danmaku or transaction data can reduce confidence for attribution.",
             "",
             "## Keywords",
             "",
@@ -49,16 +78,42 @@ class ReportBuilder:
             lines.append("")
         analyses = timeline.get("agent_analyses", [])
         if analyses:
-            lines.extend(["## Agent Analyses", ""])
+            lines.extend(["## Cloud DeepSeek Anchor Analyses", ""])
             for analysis in analyses:
+                anchor = analysis.get("anchor") or self._find_anchor(timeline, analysis.get("anchor_id"))
                 lines.append(f"### {analysis.get('anchor_id')}")
                 lines.append("")
+                if anchor:
+                    lines.append(
+                        "- Anchor: "
+                        f"{anchor.get('direction')} at {anchor.get('timestamp')}s, "
+                        f"score={anchor.get('score')}, priority={anchor.get('priority')}, "
+                        f"change={anchor.get('baseline_count')}->{anchor.get('target_count')}"
+                    )
                 lines.append(f"- Status: {analysis.get('status')}")
                 if analysis.get("response_text"):
-                    lines.append(f"- Analysis: {analysis.get('response_text')}")
+                    lines.append("")
+                    lines.append(str(analysis.get("response_text")))
                 if analysis.get("error"):
                     lines.append(f"- Error: {analysis.get('error')}")
                 lines.append("")
+        weak_anchors = self._weak_anchors(timeline)
+        if weak_anchors:
+            lines.extend(["## Unanalyzed Weak Anchors", ""])
+            lines.append("| ID | Time | Type | Score | Change | Reason |")
+            lines.append("| --- | ---: | --- | ---: | ---: | --- |")
+            for anchor in weak_anchors[:40]:
+                lines.append(
+                    "| "
+                    f"{anchor.get('anchor_id')} | "
+                    f"{anchor.get('timestamp')}s | "
+                    f"{anchor.get('direction')} | "
+                    f"{anchor.get('score')} | "
+                    f"{anchor.get('abs_change')} | "
+                    f"{str(anchor.get('reason_hint') or '').replace('|', '/')}"
+                    " |"
+                )
+            lines.append("")
         return "\n".join(lines)
 
     def markdown_to_html(self, markdown_text: str) -> str:
@@ -79,7 +134,7 @@ class ReportBuilder:
         counter: Counter[str] = Counter()
         for segment in timeline.get("aligned_segments", []):
             text = str(segment.get("text", ""))
-            for token in text.replace("，", " ").replace("。", " ").split():
+            for token in text.replace("，", " ").replace("。", " ").replace(",", " ").replace(".", " ").split():
                 if len(token) >= 2:
                     counter[token] += 1
             danmaku = segment.get("danmaku") or {}
@@ -88,3 +143,18 @@ class ReportBuilder:
                 if len(normalized) >= 2:
                     counter[normalized] += 1
         return [token for token, _ in counter.most_common(20)]
+
+    def _find_anchor(self, timeline: dict[str, Any], anchor_id: str | None) -> dict[str, Any] | None:
+        for anchor in timeline.get("anchors", []):
+            if anchor.get("anchor_id") == anchor_id:
+                return anchor
+        return None
+
+    def _weak_anchors(self, timeline: dict[str, Any]) -> list[dict[str, Any]]:
+        selection = timeline.get("analysis_selection") or {}
+        selected_ids = set(selection.get("selected_anchor_ids") or [])
+        return [
+            anchor
+            for anchor in timeline.get("anchors", [])
+            if anchor.get("anchor_id") not in selected_ids
+        ]

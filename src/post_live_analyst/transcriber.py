@@ -201,7 +201,7 @@ class FasterWhisperTranscriber:
         self.last_used_compute_type = self._detect_runtime_compute_type(model)
         transcript: list[TranscriptSegment] = []
         for segment in segments:
-            metadata = {"audio_path": str(audio_path)}
+            metadata = {}
             if offset_seconds:
                 metadata["chunk_offset_seconds"] = offset_seconds
             transcript.append(
@@ -376,7 +376,7 @@ class FasterWhisperTranscriber:
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    self._append_debug_jsonl("debug_asr_worker_events.jsonl", event)
+                    self._append_debug_jsonl("debug_asr_worker_events.jsonl", self._summarize_worker_event(event))
                     if event.get("event") == "progress" and progress_callback:
                         progress_callback(
                             int(event.get("index") or 0),
@@ -473,9 +473,34 @@ class FasterWhisperTranscriber:
             return str(compute_type)
         return "unknown"
 
+    @staticmethod
+    def _summarize_worker_event(event: dict) -> dict:
+        if event.get("event") != "result":
+            return event
+        segments = [segment for segment in event.get("segments") or [] if isinstance(segment, dict)]
+        summary = {
+            "event": "result",
+            "segment_count": len(segments),
+            "device": event.get("device"),
+            "compute_type": event.get("compute_type"),
+            "warnings": event.get("warnings") or [],
+        }
+        if segments:
+            summary["first_segment"] = _segment_debug_summary(segments[0])
+            summary["last_segment"] = _segment_debug_summary(segments[-1])
+        return summary
+
 
 def _emit_json_line(payload: dict) -> None:
-    print(json.dumps(payload, ensure_ascii=False), flush=True)
+    print(json.dumps(payload, ensure_ascii=True), flush=True)
+
+
+def _segment_debug_summary(segment: dict) -> dict:
+    return {
+        "start": segment.get("start"),
+        "end": segment.get("end"),
+        "text": str(segment.get("text") or "")[:120],
+    }
 
 
 def _load_batch_inputs(batch_path: Path) -> list[tuple[Path, float]]:

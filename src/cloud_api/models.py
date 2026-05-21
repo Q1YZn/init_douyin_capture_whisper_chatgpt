@@ -18,6 +18,8 @@ class AnalysisJob(Base):
     report_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     timeline_json: Mapped[str] = mapped_column(Text)
     report_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
     video_size_bytes: Mapped[int | None] = mapped_column(nullable=True)
     asset_storage: Mapped[str | None] = mapped_column(String(64), nullable=True)
     asset_uri: Mapped[str | None] = mapped_column(String(2048), nullable=True)

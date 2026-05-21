@@ -33,6 +33,8 @@ def ensure_analysis_job_columns() -> None:
         "asset_uri": "VARCHAR(2048)",
         "analysis_tier": "VARCHAR(64)",
         "payment_required": _dialect_type("BOOLEAN", "INTEGER"),
+        "message": "TEXT",
+        "error": "TEXT",
     }
     inspector = inspect(engine)
     existing = {column["name"] for column in inspector.get_columns("analysis_jobs")}

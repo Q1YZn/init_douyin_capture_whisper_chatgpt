@@ -1,0 +1,9 @@
+fastapi>=0.115
+uvicorn>=0.32
+sqlalchemy>=2.0
+pydantic>=2.9
+redis>=5.2
+rq>=1.16
+markdown>=3.7
+python-dotenv>=1.0
+requests>=2.32

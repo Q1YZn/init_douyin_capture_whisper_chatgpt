@@ -1,0 +1,14 @@
+.git
+.pytest_cache
+.venv
+__pycache__
+*.pyc
+captures
+demo_output
+jobs
+logs
+models
+server_reports
+tmp
+*.db
+*.wav

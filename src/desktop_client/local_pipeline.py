@@ -296,6 +296,10 @@ class DesktopAnalysisService:
         uploaded = False
         report_url = None
         cloud_report_path: Path | None = None
+        remote_job_id = None
+        remote_status = ""
+        remote_result: dict[str, Any] | None = None
+        cloud_error: str | None = None
         update_progress(0.85, no_asr_upload_message if not asr_available else "Uploading structured analysis to cloud")
         try:
             response = uploader.upload_analysis(
@@ -311,6 +315,7 @@ class DesktopAnalysisService:
                 }
             )
             uploaded = True
+            remote_result = response
             remote_job_id = response.get("job_id")
             report_url = response.get("report_url")
             remote_status = str(response.get("status") or "")
@@ -330,12 +335,37 @@ class DesktopAnalysisService:
                 report_url=report_url,
             )
         except Exception as exc:
+            cloud_error = str(exc)
+            diagnostics.append(f"Cloud upload/report failed: {exc}")
             update_progress(0.92, f"提交云端失败：{exc}")
+
+        cloud_pending_statuses = {"queued", "running", "pending_worker"}
+        cloud_status_lower = remote_status.strip().lower()
+        if uploaded and remote_job_id and not report_url and cloud_status_lower in cloud_pending_statuses:
+            final_message = "ASR completed; cloud report pending"
+        elif uploaded and remote_job_id and not report_url and cloud_status_lower == "failed":
+            final_message = "ASR completed; cloud report failed"
+        elif not asr_available:
+            final_message = no_asr_upload_message
+        else:
+            final_message = "Analysis processing completed"
+
+        self._update_manifest_cloud_state(
+            manifest_path,
+            uploaded=uploaded,
+            remote_job_id=str(remote_job_id) if remote_job_id else None,
+            cloud_status=remote_status or None,
+            report_url=str(report_url) if report_url else None,
+            cloud_report_path=str(cloud_report_path) if cloud_report_path else None,
+            last_response=remote_result,
+            error=cloud_error,
+        )
 
         update_progress(
             1.0,
-            no_asr_upload_message if not asr_available else "Analysis processing completed",
+            final_message,
             status="completed",
+            remote_job_id=remote_job_id,
             report_url=report_url,
         )
         return DesktopAnalysisResult(
@@ -358,6 +388,35 @@ class DesktopAnalysisService:
             offload_required=offload_required,
             summary_excerpt=self._build_summary_excerpt(timeline, analyses, diagnostics),
         )
+
+    def _update_manifest_cloud_state(
+        self,
+        manifest_path: Path,
+        *,
+        uploaded: bool,
+        remote_job_id: str | None,
+        cloud_status: str | None,
+        report_url: str | None,
+        cloud_report_path: str | None,
+        last_response: dict[str, Any] | None,
+        error: str | None,
+    ) -> None:
+        if not manifest_path.exists():
+            return
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        manifest["cloud"] = {
+            "uploaded": uploaded,
+            "remote_job_id": remote_job_id,
+            "status": cloud_status,
+            "report_url": report_url,
+            "cloud_report_path": cloud_report_path,
+            "last_response": last_response,
+            "error": error,
+        }
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _run_asr(
         self,

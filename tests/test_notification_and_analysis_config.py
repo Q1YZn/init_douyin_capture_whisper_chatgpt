@@ -16,7 +16,8 @@ from desktop_client.models import DesktopAnalysisRequest
 from desktop_client.notifications import MemoryPressureWatcher, RobotNotificationConfig, RobotNotifier
 from desktop_client.services import MonitorProfileService
 from desktop_client.uploader import CloudUploader
-from post_live_analyst.transcriber import FasterWhisperTranscriber
+from post_live_analyst.models import TranscriptSegment
+from post_live_analyst.transcriber import FasterWhisperTranscriber, _emit_json_line
 
 
 def test_memory_pressure_watcher_honors_threshold_and_cooldown() -> None:
@@ -219,6 +220,10 @@ def test_transcriber_chunk_batch_reuses_loaded_model(monkeypatch, tmp_path) -> N
     assert fake_model.calls == 2
     assert progress == [(1, 2, "chunk_00000.wav"), (2, 2, "chunk_00001.wav")]
     assert [segment.start for segment in transcript] == [1.0, 601.0]
+    assert "audio_path" not in transcript[0].metadata
+    assert "audio_path" not in transcript[1].metadata
+    assert transcript[0].metadata == {}
+    assert transcript[1].metadata == {"chunk_offset_seconds": 600.0}
     assert transcriber.last_used_device == "cuda"
     assert transcriber.last_used_compute_type == "int8_float16"
 
@@ -237,6 +242,36 @@ def test_strict_gpu_does_not_fallback_to_cpu(monkeypatch, tmp_path) -> None:
     transcriber = FasterWhisperTranscriber(device="cuda", compute_type="int8_float16")
     with pytest.raises(RuntimeError, match="cublas64_12"):
         transcriber.transcribe(audio_path)
+
+
+def test_asr_worker_json_lines_are_ascii_safe(capsys) -> None:
+    _emit_json_line({"event": "result", "text": "中文"})
+
+    output = capsys.readouterr().out
+    assert "\\u4e2d\\u6587" in output
+    assert "中文" not in output
+    assert json.loads(output)["text"] == "中文"
+
+
+def test_asr_debug_result_event_is_summarized() -> None:
+    event = {
+        "event": "result",
+        "segments": [
+            {"start": 0.0, "end": 1.0, "text": "第一段"},
+            {"start": 9.0, "end": 10.0, "text": "最后一段"},
+        ],
+        "device": "cuda",
+        "compute_type": "int8_float16",
+        "warnings": [],
+    }
+
+    summary = FasterWhisperTranscriber._summarize_worker_event(event)
+
+    assert "segments" not in summary
+    assert summary["segment_count"] == 2
+    assert summary["device"] == "cuda"
+    assert summary["first_segment"]["text"] == "第一段"
+    assert summary["last_segment"]["text"] == "最后一段"
 
 
 def _make_analysis_request(tmp_path: Path) -> DesktopAnalysisRequest:
@@ -314,6 +349,47 @@ def test_asr_failure_can_upload_when_require_asr_is_disabled(tmp_path, monkeypat
     assert row["message"] == "Uploaded without ASR by DSO_REQUIRE_ASR=0"
     assert uploaded_payloads
     assert "Uploaded without ASR by DSO_REQUIRE_ASR=0." in uploaded_payloads[0]["timeline"]["diagnostics"]
+
+
+def test_cloud_pending_message_when_report_url_is_not_ready(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DSO_REQUIRE_ASR", "1")
+    monkeypatch.setattr(local_pipeline.FFmpegAudioExtractor, "is_available", lambda _self: True)
+    monkeypatch.setattr(
+        services.DesktopAnalysisService,
+        "_run_asr",
+        lambda *_args, **_kwargs: [
+            TranscriptSegment(start=0.0, end=2.0, text="hello", language="zh"),
+        ],
+    )
+
+    monkeypatch.setattr(
+        CloudUploader,
+        "upload_analysis",
+        lambda *_args, **_kwargs: {"job_id": "remote-queued", "status": "queued", "report_url": None},
+    )
+    monkeypatch.setattr(
+        CloudUploader,
+        "wait_for_analysis_report",
+        lambda *_args, **_kwargs: {
+            "job_id": "remote-queued",
+            "status": "queued",
+            "message": "Report job queued",
+            "report_url": None,
+        },
+    )
+
+    settings = DesktopSettings(workspace_root=tmp_path, sqlite_path=tmp_path / "client.db")
+    repo = ClientJobRepository(settings.sqlite_path)
+    result = services.DesktopAnalysisService(settings, repo).run(_make_analysis_request(tmp_path))
+
+    row = repo.list_jobs()[0]
+    manifest = json.loads((result.workspace_dir / "analysis_manifest.json").read_text(encoding="utf-8"))
+    assert row["status"] == "completed"
+    assert row["message"] == "ASR completed; cloud report pending"
+    assert row["remote_job_id"] == "remote-queued"
+    assert manifest["cloud"]["remote_job_id"] == "remote-queued"
+    assert manifest["cloud"]["status"] == "queued"
+    assert manifest["cloud"]["report_url"] is None
 
 
 def test_cloud_uploader_debug_files_exclude_authorization_token(tmp_path, monkeypatch) -> None:

@@ -1,0 +1,22 @@
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=5
+
+WORKDIR /app
+
+COPY requirements-server-docker.txt ./
+RUN pip install --no-cache-dir \
+    -i https://mirrors.aliyun.com/pypi/simple \
+    --trusted-host mirrors.aliyun.com \
+    -r requirements-server-docker.txt
+
+COPY src ./src
+COPY scripts ./scripts
+
+EXPOSE 8000
+
+CMD ["python", "scripts/start_api.py"]

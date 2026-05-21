@@ -10,8 +10,8 @@ from fastapi.responses import FileResponse
 from .config import ServerSettings
 from .db import Base, engine, ensure_analysis_job_columns, get_session
 from .models import AnalysisJob
-from .schemas import AnalysisJobCreate, AnalysisJobResponse
-from .tasks import enqueue_report_job
+from .schemas import AnalysisJobCreate, AnalysisJobResponse, ClipCandidatesRequest, ClipCandidatesResponse
+from .tasks import enqueue_report_job, generate_clip_candidates, generate_report
 
 
 settings = ServerSettings.from_env()
@@ -33,6 +33,7 @@ def create_analysis_job(payload: AnalysisJobCreate) -> AnalysisJobResponse:
             job_id=job_id,
             client_job_id=payload.client_job_id,
             status="queued",
+            message="Report job queued",
             summary_markdown=payload.summary_markdown,
             timeline_json=json.dumps(payload.timeline, ensure_ascii=False),
             video_size_bytes=payload.video_size_bytes,
@@ -43,19 +44,44 @@ def create_analysis_job(payload: AnalysisJobCreate) -> AnalysisJobResponse:
         )
         session.add(job)
         session.commit()
+    status = "queued"
+    message = "Report job queued"
+    error: str | None = None
+    updated_at = None
+    report_path: str | None = None
     try:
         enqueue_report_job(job_id)
     except Exception:
-        with get_session() as session:
-            job = session.get(AnalysisJob, job_id)
-            if job:
-                job.status = "pending_worker"
-                session.add(job)
-                session.commit()
+        try:
+            generate_report(job_id)
+            with get_session() as session:
+                job = session.get(AnalysisJob, job_id)
+                if job:
+                    status = job.status
+                    message = job.message or message
+                    error = job.error
+                    updated_at = job.updated_at
+                    report_path = job.report_path
+        except Exception as exc:
+            status = "pending_worker"
+            message = "Report worker unavailable; job is waiting for retry"
+            error = str(exc)[:2000]
+            with get_session() as session:
+                job = session.get(AnalysisJob, job_id)
+                if job:
+                    job.status = status
+                    job.message = message
+                    job.error = error
+                    session.add(job)
+                    session.commit()
+                    updated_at = job.updated_at
     return AnalysisJobResponse(
         job_id=job_id,
-        status="queued",
-        report_url=f"{settings.public_base_url}/api/v1/analysis-jobs/{job_id}/report",
+        status=status,
+        message=message,
+        error=error,
+        updated_at=updated_at,
+        report_url=f"{settings.public_base_url}/api/v1/analysis-jobs/{job_id}/report" if status == "completed" or report_path else None,
     )
 
 
@@ -70,7 +96,14 @@ def get_analysis_job(job_id: str) -> AnalysisJobResponse:
             if job.report_path
             else None
         )
-        return AnalysisJobResponse(job_id=job.job_id, status=job.status, report_url=report_url)
+        return AnalysisJobResponse(
+            job_id=job.job_id,
+            status=job.status,
+            report_url=report_url,
+            message=job.message,
+            error=job.error,
+            updated_at=job.updated_at,
+        )
 
 
 @app.get("/api/v1/analysis-jobs/{job_id}/report")
@@ -83,3 +116,22 @@ def get_report(job_id: str) -> FileResponse:
         if not path.exists():
             raise HTTPException(status_code=404, detail="report file missing")
         return FileResponse(path, media_type="text/html")
+
+
+@app.post("/api/v1/clip-candidates", response_model=ClipCandidatesResponse)
+def create_clip_candidates(payload: ClipCandidatesRequest) -> ClipCandidatesResponse:
+    try:
+        result = generate_clip_candidates(
+            payload.timeline,
+            summary_markdown=payload.summary_markdown,
+            max_candidates=payload.max_candidates or 20,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return ClipCandidatesResponse(
+        job_id=uuid.uuid4().hex,
+        status="completed",
+        candidates=result["candidates"],
+        model_id=result.get("model_id"),
+        raw_response=result.get("raw_response"),
+    )
